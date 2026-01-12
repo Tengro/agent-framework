@@ -1,0 +1,133 @@
+import type { JsStore } from 'chronicle';
+import type { Membrane } from 'membrane';
+import type { Module } from './module.js';
+import type { AgentConfig, InferenceRequest } from './agent.js';
+import type { QueueEvent } from './events.js';
+
+/**
+ * Configuration for the agent framework.
+ */
+export interface FrameworkConfig {
+  /** Path to Chronicle store */
+  storePath?: string;
+
+  /** Or existing store (app-owned) */
+  store?: JsStore;
+
+  /** Membrane instance for LLM calls */
+  membrane: Membrane;
+
+  /** Agent configurations */
+  agents: AgentConfig[];
+
+  /** Modules to load */
+  modules: Module[];
+
+  /** Custom inference policy */
+  inferencePolicy?: InferencePolicy;
+
+  /** Custom error policy */
+  errorPolicy?: ErrorPolicy;
+
+  /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
+  syncIntervalMs?: number;
+}
+
+/**
+ * Policy for deciding when to run inference.
+ */
+export interface InferencePolicy {
+  /**
+   * Decide whether to run inference for an agent.
+   */
+  shouldInfer(
+    agentName: string,
+    requests: InferenceRequest[],
+    state: FrameworkState
+  ): boolean;
+}
+
+/**
+ * Policy for handling errors.
+ */
+export interface ErrorPolicy {
+  /**
+   * Handle an inference error.
+   */
+  onInferenceError(
+    error: Error,
+    agentName: string,
+    attempt: number
+  ): ErrorAction;
+
+  /** Maximum retry attempts */
+  maxRetries: number;
+}
+
+/**
+ * Action to take after an error.
+ */
+export type ErrorAction =
+  | { retry: true; delayMs: number }
+  | { retry: false; emit?: QueueEvent };
+
+/**
+ * Framework state exposed to policies.
+ */
+export interface FrameworkState {
+  /** Get agent status */
+  getAgentStatus(name: string): import('./agent.js').AgentState | null;
+
+  /** Get module by name */
+  getModule(name: string): Module | null;
+
+  /** Get all pending inference requests */
+  getPendingRequests(): InferenceRequest[];
+
+  /** Current queue depth */
+  queueDepth: number;
+}
+
+/**
+ * Events emitted by the framework for observability.
+ */
+export type FrameworkEvent =
+  | { type: 'message:added'; messageId: string; source: string }
+  | { type: 'inference:start'; agentName: string }
+  | { type: 'inference:complete'; agentName: string; durationMs: number }
+  | { type: 'inference:error'; agentName: string; error: Error }
+  | { type: 'tool:start'; moduleName: string; toolName: string; callId: string }
+  | { type: 'tool:complete'; moduleName: string; toolName: string; callId: string; durationMs: number }
+  | { type: 'tool:error'; moduleName: string; toolName: string; callId: string; error: Error }
+  | { type: 'module:start'; moduleName: string }
+  | { type: 'module:stop'; moduleName: string }
+  | { type: 'queue:event'; event: QueueEvent };
+
+/**
+ * Listener for framework events.
+ */
+export type FrameworkEventListener = (event: FrameworkEvent) => void;
+
+/**
+ * Entry in the inference log.
+ */
+export interface InferenceLogEntry {
+  timestamp: number;
+  agentName: string;
+  requestId: string;
+  /** Whether inference succeeded */
+  success: boolean;
+  /** Error message if failed */
+  error?: string;
+  /** Request data or blob ID if large */
+  request: unknown | { blobId: string };
+  /** Response data or blob ID if large (only if successful) */
+  response?: unknown | { blobId: string };
+  durationMs: number;
+  tokenUsage?: {
+    input: number;
+    output: number;
+  };
+  /** Stop reason from the model */
+  stopReason?: string;
+}

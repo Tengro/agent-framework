@@ -1,0 +1,402 @@
+import type { JsStore } from 'chronicle';
+import type { ContentBlock } from 'membrane';
+import type { MessageId, MessageMetadata } from '@connectome/context-manager';
+import type {
+  Module,
+  ModuleContext,
+  EventQueue,
+  ToolDefinition,
+  ToolCall,
+  ToolResult,
+  AgentInfo,
+  ExternalIdRef,
+  SpeechContext,
+  SpeechHandlerOptions,
+} from './types/index.js';
+import type { Agent } from './agent.js';
+
+const MODULE_STATE_PREFIX = 'modules/';
+
+/**
+ * Registered speech handler.
+ */
+interface SpeechHandler {
+  moduleName: string;
+  agents: '*' | string[];
+  priority: number;
+}
+
+
+/**
+ * Registry for managing modules.
+ */
+export class ModuleRegistry {
+  private modules: Map<string, Module> = new Map();
+  private moduleContexts: Map<string, ModuleContextImpl> = new Map();
+  private speechHandlers: SpeechHandler[] = [];
+  private store: JsStore;
+  private queue: EventQueue;
+  private getAgents: () => Agent[];
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
+  private removeMessageFn: (id: MessageId) => void;
+
+  constructor(
+    store: JsStore,
+    queue: EventQueue,
+    options: {
+      getAgents: () => Agent[];
+      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+      editMessage: (id: MessageId, content: ContentBlock[]) => void;
+      removeMessage: (id: MessageId) => void;
+    }
+  ) {
+    this.store = store;
+    this.queue = queue;
+    this.getAgents = options.getAgents;
+    this.addMessageFn = options.addMessage;
+    this.editMessageFn = options.editMessage;
+    this.removeMessageFn = options.removeMessage;
+  }
+
+  /**
+   * Register and start a module.
+   */
+  async addModule(module: Module): Promise<void> {
+    if (this.modules.has(module.name)) {
+      throw new Error(`Module already registered: ${module.name}`);
+    }
+
+    // Register module state in store
+    const stateId = this.getStateId(module.name);
+    try {
+      this.store.registerState({
+        id: stateId,
+        strategy: 'snapshot',
+      });
+    } catch {
+      // State already registered (from previous run)
+    }
+
+    // Check if this is a restart (state exists)
+    const existingState = this.store.getStateJson(stateId);
+    const isRestart = existingState !== null;
+
+    // Create context
+    const context = new ModuleContextImpl(
+      module.name,
+      this.store,
+      stateId,
+      this.queue,
+      this,
+      isRestart,
+      this.getAgents,
+      this.addMessageFn,
+      this.editMessageFn,
+      this.removeMessageFn
+    );
+
+    this.modules.set(module.name, module);
+    this.moduleContexts.set(module.name, context);
+
+    // Start the module
+    await module.start(context);
+  }
+
+  /**
+   * Stop and unregister a module.
+   */
+  async removeModule(name: string): Promise<void> {
+    const module = this.modules.get(name);
+    if (!module) {
+      throw new Error(`Module not found: ${name}`);
+    }
+
+    await module.stop();
+    this.modules.delete(name);
+    this.moduleContexts.delete(name);
+  }
+
+  /**
+   * Get a module by name.
+   */
+  getModule<T extends Module>(name: string): T | null {
+    return (this.modules.get(name) as T) ?? null;
+  }
+
+  /**
+   * Get all registered modules.
+   */
+  getAllModules(): Module[] {
+    return Array.from(this.modules.values());
+  }
+
+  /**
+   * Get all available tools from all modules.
+   */
+  getAllTools(): ToolDefinition[] {
+    const tools: ToolDefinition[] = [];
+    for (const module of this.modules.values()) {
+      for (const tool of module.getTools()) {
+        tools.push({
+          ...tool,
+          name: `${module.name}:${tool.name}`,
+        });
+      }
+    }
+    return tools;
+  }
+
+  /**
+   * Handle a tool call by routing to the appropriate module.
+   */
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    // Parse module:tool name
+    const colonIndex = call.name.indexOf(':');
+    if (colonIndex === -1) {
+      return {
+        success: false,
+        error: `Invalid tool name format: ${call.name}`,
+        isError: true,
+      };
+    }
+
+    const moduleName = call.name.substring(0, colonIndex);
+    const toolName = call.name.substring(colonIndex + 1);
+
+    const module = this.modules.get(moduleName);
+    if (!module) {
+      return {
+        success: false,
+        error: `Module not found: ${moduleName}`,
+        isError: true,
+      };
+    }
+
+    // Create a call with the un-prefixed name
+    const moduleCall: ToolCall = {
+      id: call.id,
+      name: toolName,
+      input: call.input,
+    };
+
+    try {
+      return await module.handleToolCall(moduleCall);
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * Stop all modules.
+   */
+  async stopAll(): Promise<void> {
+    const stopPromises = Array.from(this.modules.values()).map((m) => m.stop());
+    await Promise.all(stopPromises);
+    this.modules.clear();
+    this.moduleContexts.clear();
+    this.speechHandlers = [];
+  }
+
+  /**
+   * Register a module as a speech handler.
+   */
+  registerSpeechHandler(
+    moduleName: string,
+    agents: '*' | string[],
+    options: SpeechHandlerOptions = {}
+  ): void {
+    const priority = options.priority ?? 0;
+
+    if (!options.additive) {
+      // Remove existing handlers for this module
+      this.speechHandlers = this.speechHandlers.filter(
+        (h) => h.moduleName !== moduleName
+      );
+    }
+
+    this.speechHandlers.push({ moduleName, agents, priority });
+
+    // Sort by priority (higher first)
+    this.speechHandlers.sort((a, b) => b.priority - a.priority);
+  }
+
+  /**
+   * Unregister a module as a speech handler.
+   */
+  unregisterSpeechHandler(moduleName: string): void {
+    this.speechHandlers = this.speechHandlers.filter(
+      (h) => h.moduleName !== moduleName
+    );
+  }
+
+  /**
+   * Dispatch speech to registered handlers.
+   */
+  async dispatchSpeech(
+    agentName: string,
+    content: ContentBlock[],
+    context: SpeechContext
+  ): Promise<void> {
+    // Find handlers that match this agent
+    const handlers = this.speechHandlers.filter(
+      (h) => h.agents === '*' || h.agents.includes(agentName)
+    );
+
+    // Call each handler
+    for (const handler of handlers) {
+      const module = this.modules.get(handler.moduleName);
+      if (module?.onAgentSpeech) {
+        try {
+          await module.onAgentSpeech(agentName, content, context);
+        } catch (error) {
+          console.error(
+            `Speech handler ${handler.moduleName} error:`,
+            error
+          );
+        }
+      }
+    }
+  }
+
+  private getStateId(moduleName: string): string {
+    return `${MODULE_STATE_PREFIX}${moduleName}/state`;
+  }
+}
+
+/**
+ * Implementation of ModuleContext.
+ */
+class ModuleContextImpl implements ModuleContext {
+  private moduleName: string;
+  private store: JsStore;
+  private stateId: string;
+  readonly queue: EventQueue;
+  private registry: ModuleRegistry;
+  readonly isRestart: boolean;
+  private getAgentsFn: () => Agent[];
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
+  private removeMessageFn: (id: MessageId) => void;
+
+  // External ID mapping stored in module state
+  private externalIdMap: Map<string, MessageId> = new Map();
+
+  constructor(
+    moduleName: string,
+    store: JsStore,
+    stateId: string,
+    queue: EventQueue,
+    registry: ModuleRegistry,
+    isRestart: boolean,
+    getAgents: () => Agent[],
+    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
+    editMessage: (id: MessageId, content: ContentBlock[]) => void,
+    removeMessage: (id: MessageId) => void
+  ) {
+    this.moduleName = moduleName;
+    this.store = store;
+    this.stateId = stateId;
+    this.queue = queue;
+    this.registry = registry;
+    this.isRestart = isRestart;
+    this.getAgentsFn = getAgents;
+    this.addMessageFn = addMessage;
+    this.editMessageFn = editMessage;
+    this.removeMessageFn = removeMessage;
+
+    // Load external ID map from state if exists
+    const state = this.getState<{ externalIdMap?: Record<string, string> }>();
+    if (state?.externalIdMap) {
+      this.externalIdMap = new Map(Object.entries(state.externalIdMap));
+    }
+  }
+
+  getState<T>(): T | null {
+    const state = this.store.getStateJson(this.stateId);
+    return state as T | null;
+  }
+
+  setState<T>(state: T): void {
+    // Merge external ID map into state
+    const fullState = {
+      ...(state as object),
+      externalIdMap: Object.fromEntries(this.externalIdMap),
+    };
+    this.store.setStateJson(this.stateId, fullState);
+  }
+
+  getModule<T extends Module>(name: string): T | null {
+    return this.registry.getModule<T>(name);
+  }
+
+  addMessage(
+    participant: string,
+    content: ContentBlock[],
+    metadata?: MessageMetadata & { external?: ExternalIdRef }
+  ): MessageId {
+    const id = this.addMessageFn(participant, content, metadata);
+
+    // Track external ID if provided
+    if (metadata?.external) {
+      const key = `${metadata.external.source}:${metadata.external.id}`;
+      this.externalIdMap.set(key, id);
+      // Persist the mapping
+      this.persistExternalIdMap();
+    }
+
+    return id;
+  }
+
+  editMessage(id: MessageId, content: ContentBlock[]): void {
+    this.editMessageFn(id, content);
+  }
+
+  removeMessage(id: MessageId): void {
+    this.removeMessageFn(id);
+    // Clean up external ID mapping
+    for (const [key, msgId] of this.externalIdMap) {
+      if (msgId === id) {
+        this.externalIdMap.delete(key);
+        this.persistExternalIdMap();
+        break;
+      }
+    }
+  }
+
+  findMessageByExternalId(source: string, externalId: string): MessageId | null {
+    const key = `${source}:${externalId}`;
+    return this.externalIdMap.get(key) ?? null;
+  }
+
+  getAgents(): AgentInfo[] {
+    return this.getAgentsFn().map((a) => a.info);
+  }
+
+  getActiveTools(): ToolDefinition[] {
+    return this.registry.getAllTools();
+  }
+
+  registerSpeechHandler(
+    agents: '*' | string[],
+    options?: SpeechHandlerOptions
+  ): void {
+    this.registry.registerSpeechHandler(this.moduleName, agents, options);
+  }
+
+  unregisterSpeechHandler(): void {
+    this.registry.unregisterSpeechHandler(this.moduleName);
+  }
+
+  private persistExternalIdMap(): void {
+    const currentState = this.getState<object>() ?? {};
+    this.setState({
+      ...currentState,
+      externalIdMap: Object.fromEntries(this.externalIdMap),
+    });
+  }
+}

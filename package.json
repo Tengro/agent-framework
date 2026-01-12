@@ -1,0 +1,53 @@
+{
+  "name": "@connectome/agent-framework",
+  "version": "0.1.0",
+  "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "bin": {
+    "agent-framework-mcp": "./dist/src/api/mcp-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist/test/*.test.js"
+  },
+  "keywords": [
+    "connectome",
+    "agent",
+    "framework",
+    "llm",
+    "multi-agent",
+    "modules"
+  ],
+  "author": "Anima Research",
+  "license": "MIT",
+  "dependencies": {
+    "@connectome/context-manager": "file:../context-manager",
+    "chronicle": "file:../record-store",
+    "membrane": "file:../membrane",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

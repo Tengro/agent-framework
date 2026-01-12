@@ -1,0 +1,182 @@
+import type { ContentBlock, ToolDefinition as MembraneToolDefinition } from 'membrane';
+import type { MessageId } from '@connectome/context-manager';
+
+/**
+ * Unique identifier for a tool call.
+ */
+export type ToolCallId = string;
+
+/**
+ * Re-export membrane's ToolDefinition for modules to use.
+ */
+export type ToolDefinition = MembraneToolDefinition;
+
+/**
+ * Events that flow through the framework's event queue.
+ *
+ * Modules can define their own namespaced events (e.g., 'api:message', 'discord:reaction').
+ * The framework dispatches all events to modules via onEvent().
+ */
+export type QueueEvent =
+  | ExternalMessageEvent
+  | ToolResultEvent
+  | TimerFiredEvent
+  | InferenceRequestEvent
+  | MessageEditedEvent
+  | MessageRemovedEvent
+  | ModuleEvent
+  | ApiMessageEvent
+  | ApiInferenceRequestEvent
+  | CustomEvent;
+
+/**
+ * API message event - from the API server.
+ */
+export interface ApiMessageEvent {
+  type: 'api:message';
+  participant: string;
+  content: string;
+  metadata?: Record<string, unknown>;
+  triggerInference?: boolean;
+  targetAgents?: string[];
+}
+
+/**
+ * API inference request - from the API server.
+ */
+export interface ApiInferenceRequestEvent {
+  type: 'api:inference-request';
+  agentName?: string;
+  reason?: string;
+}
+
+/**
+ * Generic custom event for module-specific namespaced events.
+ * Use this for events like 'discord:message', 'slack:reaction', etc.
+ */
+export interface CustomEvent {
+  type: `${string}:${string}`;
+  [key: string]: unknown;
+}
+
+/**
+ * Message from an external source (Discord, HTTP, CLI, etc.)
+ */
+export interface ExternalMessageEvent {
+  type: 'external-message';
+  /** Module that produced this event */
+  source: string;
+  /** Raw content from external system */
+  content: unknown;
+  /** External system metadata */
+  metadata: Record<string, unknown>;
+  /** Whether this should trigger inference */
+  triggerInference?: boolean;
+  /** Specific agents to trigger (if not all) */
+  targetAgents?: string[];
+}
+
+/**
+ * Result of a tool call.
+ */
+export interface ToolResultEvent {
+  type: 'tool-result';
+  /** ID of the original tool call */
+  callId: ToolCallId;
+  /** Agent that made the call */
+  agentName: string;
+  /** Module that handled the call */
+  moduleName: string;
+  /** Result of the tool call */
+  result: ToolResult;
+}
+
+/**
+ * Scheduled timer fired.
+ */
+export interface TimerFiredEvent {
+  type: 'timer-fired';
+  /** Timer identifier */
+  timerId: string;
+  /** Reason for the timer */
+  reason: string;
+  /** Specific agent to wake (if any) */
+  agentName?: string;
+}
+
+/**
+ * Explicit request to run inference.
+ */
+export interface InferenceRequestEvent {
+  type: 'inference-request';
+  /** Agent to run inference for */
+  agentName: string;
+  /** Reason for the request */
+  reason: string;
+  /** Module that requested it */
+  source: string;
+}
+
+/**
+ * External message was edited.
+ */
+export interface MessageEditedEvent {
+  type: 'message-edited';
+  /** Module that produced this event */
+  source: string;
+  /** Our internal message ID */
+  messageId: MessageId;
+  /** New content */
+  newContent: ContentBlock[];
+}
+
+/**
+ * External message was removed.
+ */
+export interface MessageRemovedEvent {
+  type: 'message-removed';
+  /** Module that produced this event */
+  source: string;
+  /** Our internal message ID */
+  messageId: MessageId;
+}
+
+/**
+ * Generic module-specific event.
+ */
+export interface ModuleEvent {
+  type: 'module-event';
+  /** Module that produced this event */
+  source: string;
+  /** Module-specific event type */
+  eventType: string;
+  /** Module-specific payload */
+  payload: unknown;
+}
+
+/**
+ * Result of a tool execution.
+ */
+export interface ToolResult {
+  /** Whether the tool succeeded */
+  success: boolean;
+  /** Result data (if success) */
+  data?: unknown;
+  /** Error message (if failure) */
+  error?: string;
+  /** Whether this was an error (for LLM) */
+  isError?: boolean;
+}
+
+/**
+ * A tool call from the LLM.
+ */
+export interface ToolCall {
+  /** Unique ID for this call */
+  id: ToolCallId;
+  /** Full tool name (module:tool) */
+  name: string;
+  /** Tool input */
+  input: unknown;
+}
+
