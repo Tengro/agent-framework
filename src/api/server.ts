@@ -520,19 +520,15 @@ export class ApiServer {
   }
 
   private async cmdModuleList(): Promise<{ modules: ModuleInfo[] }> {
-    // Get modules through the framework
-    // Note: We need to expose getAllModules from framework
-    const store = this.framework.getStore();
-
-    // For now, list module states from store
-    const states = store.listStates();
-    const moduleStates = states.filter((s) => s.id.startsWith('modules/'));
-    const moduleNames = [...new Set(moduleStates.map((s) => s.id.split('/')[1]))];
+    const modules = this.framework.getAllModules();
+    const allTools = this.framework.getAllTools();
 
     return {
-      modules: moduleNames.map((name) => ({
-        name,
-        tools: [], // Would need framework access
+      modules: modules.map((module) => ({
+        name: module.name,
+        tools: allTools
+          .filter((t) => t.name.startsWith(`${module.name}:`))
+          .map((t) => t.name),
       })),
     };
   }

@@ -306,6 +306,20 @@ export class AgentFramework {
   }
 
   /**
+   * Get all registered modules.
+   */
+  getAllModules(): Module[] {
+    return this.moduleRegistry.getAllModules();
+  }
+
+  /**
+   * Get all available tools from all modules.
+   */
+  getAllTools(): import('./types/index.js').ToolDefinition[] {
+    return this.moduleRegistry.getAllTools();
+  }
+
+  /**
    * Check if process logging is enabled.
    */
   isProcessLoggingEnabled(): { persist: boolean; broadcast: boolean } {
