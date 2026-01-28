@@ -1,7 +1,13 @@
 import { JsStore } from 'chronicle';
 import type { Membrane, ContentBlock } from 'membrane';
 import { ContextManager, PassthroughStrategy } from '@connectome/context-manager';
-import type { MessageId, MessageMetadata } from '@connectome/context-manager';
+import type {
+  MessageId,
+  MessageMetadata,
+  MessageQuery,
+  MessageQueryResult,
+  StoredMessage,
+} from '@connectome/context-manager';
 import type {
   FrameworkConfig,
   InferencePolicy,
@@ -115,6 +121,8 @@ export class AgentFramework {
       addMessage: (p, c, m) => this.addMessage(p, c, m),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
+      getMessage: (id) => this.getMessage(id),
+      queryMessages: (filter) => this.queryMessages(filter),
     });
   }
 
@@ -1027,6 +1035,22 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
     agent.getContextManager().removeMessage(id);
+  }
+
+  private getMessage(id: MessageId): StoredMessage | null {
+    const agent = this.agents.values().next().value;
+    if (!agent) {
+      return null;
+    }
+    return agent.getContextManager().getMessage(id);
+  }
+
+  private queryMessages(filter: MessageQuery): MessageQueryResult {
+    const agent = this.agents.values().next().value;
+    if (!agent) {
+      return { messages: [], totalCount: 0 };
+    }
+    return agent.getContextManager().queryMessages(filter);
   }
 
   private createFrameworkState(): FrameworkState {

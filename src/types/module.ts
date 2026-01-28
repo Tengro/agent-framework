@@ -1,5 +1,11 @@
 import type { ContentBlock } from 'membrane';
-import type { MessageId, MessageMetadata } from '@connectome/context-manager';
+import type {
+  MessageId,
+  MessageMetadata,
+  MessageQuery,
+  MessageQueryResult,
+  StoredMessage,
+} from '@connectome/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
 
 /**
@@ -101,6 +107,17 @@ export interface ModuleContext {
    * Find a message by external ID.
    */
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
+
+  /**
+   * Get a message by ID.
+   */
+  getMessage(id: MessageId): StoredMessage | null;
+
+  /**
+   * Query messages by filter criteria.
+   * Useful for finding messages from external sources, by participant, etc.
+   */
+  queryMessages(filter: MessageQuery): MessageQueryResult;
 
   /**
    * Get info about all agents.
