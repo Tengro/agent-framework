@@ -138,6 +138,8 @@ export interface InferenceLogEntry {
   tokenUsage?: {
     input: number;
     output: number;
+    cacheCreation?: number;
+    cacheRead?: number;
   };
   /** Stop reason from the model */
   stopReason?: string;

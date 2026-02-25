@@ -539,6 +539,7 @@ export class McplServerConnection extends EventEmitter {
     [McplMethod.ChannelsChanged]: 'channels-changed',
     [McplMethod.ChannelsIncoming]: 'channels-incoming',
     [McplMethod.FeatureSetsChanged]: 'feature-sets-changed',
+    'notifications/tools/list_changed': 'tools-list-changed',
   };
 
   /**

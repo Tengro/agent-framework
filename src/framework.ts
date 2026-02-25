@@ -1,5 +1,5 @@
 import { JsStore } from 'chronicle';
-import type { Membrane, ContentBlock, YieldingStream, ToolResult as MembraneToolResult } from 'membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult } from 'membrane';
 import { ContextManager, PassthroughStrategy } from '@connectome/context-manager';
 import type {
   MessageId,
@@ -119,6 +119,7 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+  private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
 
   // MCPL subsystems (null when no mcplServers configured)
   private mcplServerRegistry: McplServerRegistry | null = null;
@@ -130,6 +131,8 @@ export class AgentFramework {
   private channelRegistry: ChannelRegistry | null = null;
   private checkpointManager: CheckpointManager | null = null;
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
+  private mcplToolRefreshInFlight = false;
+  private mcplToolRefreshPending = false;
 
   private constructor(
     store: JsStore,
@@ -768,22 +771,34 @@ export class AgentFramework {
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
         if (currentState.status === 'ready') {
+          // Flush pending assistant blocks (tool_use + preamble text) to context
+          const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
+          if (pendingBlocks) {
+            agent.addAssistantResponse(pendingBlocks);
+            this.pendingAssistantBlocks.delete(agent.name);
+          }
+
+          // Store tool results as a user message (tool_result blocks)
+          const toolResultContent: ContentBlock[] = currentState.toolResults.map(tc => ({
+            type: 'tool_result' as const,
+            toolUseId: tc.id,
+            content: tc.result.isError
+              ? (tc.result.error ?? 'Unknown error')
+              : JSON.stringify(tc.result.data),
+            isError: tc.result.isError,
+          }));
+          agent.getContextManager().addMessage('user', toolResultContent);
+
           // Check if any tool result requested endTurn
           const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
 
           if (shouldEndTurn) {
-            // endTurn: save tool_use + tool_result to context, cancel stream, reset to idle.
-            // The LLM expects this call to block — agent sleeps until next event.
+            // endTurn: messages already stored above, cancel stream, reset to idle.
             if (currentState.stream) {
-              // Provide results so they get saved to context, then cancel
-              const membraneResults = currentState.toolResults.map(tc =>
-                this.toMembraneToolResult(tc.id, tc.result)
-              );
-              currentState.stream.provideToolResults(membraneResults);
               agent.cancelStream();
             }
             agent.reset();
-            this.emitTrace({ type: 'inference:completed', agentName: agent.name, durationMs: 0 });
+            this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream
             const membraneResults = currentState.toolResults.map(tc =>
@@ -944,9 +959,9 @@ export class AgentFramework {
         }
       }
 
-      const stream = await agent.startStreamWithInjections(tools, injections);
+      const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
 
-      const handle = this.driveStream(agent, stream, trigger, attempt);
+      const handle = this.driveStream(agent, stream, trigger, attempt, compiledRequest);
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -972,10 +987,12 @@ export class AgentFramework {
     agent: Agent,
     stream: YieldingStream,
     trigger?: InferenceRequest,
-    attempt = 0
+    attempt = 0,
+    compiledRequest?: NormalizedRequest
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
+    let hadToolCalls = false;
 
     try {
       for await (const event of stream) {
@@ -988,12 +1005,24 @@ export class AgentFramework {
             });
             break;
 
-          case 'tool-calls':
+          case 'tool-calls': {
+            hadToolCalls = true;
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
               agentName: agent.name,
-              calls: event.calls.map((c) => ({ id: c.id, name: c.name })),
+              calls: event.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
             });
+
+            // Build assistant content blocks from preamble text + tool_use blocks
+            const assistantBlocks: ContentBlock[] = [];
+            if (event.context.preamble) {
+              assistantBlocks.push({ type: 'text', text: event.context.preamble });
+            }
+            for (const c of event.calls) {
+              assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input as Record<string, unknown> });
+            }
+            this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
+
             agent.enterWaitingForTools(event.calls, stream);
             // Dispatch each tool call (async, results come back via ToolResultEvent)
             for (const call of event.calls) {
@@ -1001,13 +1030,28 @@ export class AgentFramework {
             }
             // Stream's async iterator blocks on next() until provideToolResults() is called
             break;
+          }
 
           case 'complete': {
             const durationMs = Date.now() - startTime;
             const response = event.response;
 
-            // Add assistant response to context
-            agent.addAssistantResponse(response.content);
+            // Add assistant response to context.
+            // If we had tool calls, the tool_use blocks were already stored as
+            // pendingAssistantBlocks and flushed when tool results arrived.
+            // Only store trailing content (text after the last tool round) to
+            // avoid double-storing tool_use blocks.
+            if (hadToolCalls) {
+              // Filter to only trailing text/thinking blocks (no tool_use — those are already stored)
+              const trailingContent = response.content.filter(
+                (block: ContentBlock) => block.type !== 'tool_use' && block.type !== 'tool_result'
+              );
+              if (trailingContent.length > 0) {
+                agent.addAssistantResponse(trailingContent);
+              }
+            } else {
+              agent.addAssistantResponse(response.content);
+            }
 
             // Run afterInference hooks (no-op if no MCPL servers)
             if (this.hookOrchestrator) {
@@ -1032,6 +1076,8 @@ export class AgentFramework {
                   usage: {
                     inputTokens: response.usage?.inputTokens ?? 0,
                     outputTokens: response.usage?.outputTokens ?? 0,
+                    cacheCreationTokens: response.details?.usage?.cacheCreationTokens,
+                    cacheReadTokens: response.details?.usage?.cacheReadTokens,
                   },
                 };
 
@@ -1049,7 +1095,12 @@ export class AgentFramework {
             );
 
             const tokenUsage = response.usage
-              ? { input: response.usage.inputTokens, output: response.usage.outputTokens }
+              ? {
+                  input: response.usage.inputTokens,
+                  output: response.usage.outputTokens,
+                  cacheCreation: response.details?.usage?.cacheCreationTokens,
+                  cacheRead: response.details?.usage?.cacheReadTokens,
+                }
               : undefined;
             this.emitTrace({
               type: 'inference:completed',
@@ -1064,7 +1115,7 @@ export class AgentFramework {
               agentName: agent.name,
               requestId,
               success: true,
-              request: { note: 'streaming request' },
+              request: compiledRequest ?? { note: 'streaming request' },
               response: response.raw ?? { note: 'streaming response' },
               durationMs,
               tokenUsage,
@@ -1109,7 +1160,7 @@ export class AgentFramework {
               requestId,
               success: false,
               error: err.message,
-              request: { note: 'streaming request failed' },
+              request: compiledRequest ?? { note: 'streaming request failed' },
               durationMs,
             });
 
@@ -1146,6 +1197,7 @@ export class AgentFramework {
       agent.reset();
     } finally {
       this.activeStreams.delete(agent.name);
+      this.pendingAssistantBlocks.delete(agent.name);
     }
   }
 
@@ -1234,6 +1286,7 @@ export class AgentFramework {
       module: moduleName,
       tool: call.name,
       callId: call.id,
+      input: call.input,
     });
 
     const startTime = Date.now();
@@ -1561,6 +1614,16 @@ export class AgentFramework {
       this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
+    // Handle dynamic tool list changes (notifications/tools/list_changed)
+    connection.on('tools-list-changed', () => {
+      this.handleToolsListChanged(connection.id);
+    });
+
+    // Also refresh tools on reconnect (server may have different tools)
+    connection.on('reconnect', () => {
+      this.handleToolsListChanged(connection.id);
+    });
+
     // Cleanup on disconnect
     connection.on('close', () => {
       this.featureSetManager?.removeServer(connection.id);
@@ -1599,6 +1662,60 @@ export class AgentFramework {
   }
 
   /**
+   * Handle a tools/list_changed notification with collapse logic.
+   * At most 2 refresh cycles can be in-flight: one running and one pending.
+   */
+  private handleToolsListChanged(serverId: string): void {
+    if (this.mcplToolRefreshInFlight) {
+      this.mcplToolRefreshPending = true;
+      return;
+    }
+
+    this.mcplToolRefreshInFlight = true;
+    const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+
+    this.refreshMcplTools()
+      .then(() => {
+        this.emitMcplToolDiff(oldToolNames, serverId);
+      })
+      .catch((error) => {
+        console.error('MCPL tool refresh error:', error);
+      })
+      .finally(() => {
+        this.mcplToolRefreshInFlight = false;
+        if (this.mcplToolRefreshPending) {
+          this.mcplToolRefreshPending = false;
+          this.handleToolsListChanged(serverId);
+        }
+      });
+  }
+
+  /**
+   * Emit a trace event and push an external-message listing newly added tools.
+   */
+  private emitMcplToolDiff(oldToolNames: Set<string>, serverId: string): void {
+    const newTools = this.mcplTools.filter(t => !oldToolNames.has(t.name));
+    const removedTools = [...oldToolNames].filter(name => !this.mcplTools.some(t => t.name === name));
+
+    if (newTools.length === 0 && removedTools.length === 0) return;
+
+    this.emitTrace({
+      type: 'module:added',
+      moduleName: `mcpl:${serverId}:tools-refreshed`,
+    });
+
+    if (newTools.length > 0) {
+      const toolList = newTools.map(t => t.name).join(', ');
+      this.pushEvent({
+        type: 'external-message',
+        source: `mcpl:${serverId}`,
+        content: `New tools available: ${toolList}`,
+        metadata: { newTools: newTools.map(t => t.name), removedTools },
+      });
+    }
+  }
+
+  /**
    * Dispatch a tool call to an MCPL server.
    * Parses `mcpl:{serverId}:{toolName}` and routes accordingly.
    */
@@ -1631,7 +1748,7 @@ export class AgentFramework {
       return;
     }
 
-    this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id });
+    this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
 
@@ -1702,7 +1819,7 @@ export class AgentFramework {
    * Dispatch a synthesized channel tool call.
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id });
+    this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input)

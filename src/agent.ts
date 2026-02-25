@@ -1,4 +1,9 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from 'membrane';
+
+export interface StartStreamResult {
+  stream: YieldingStream;
+  request: NormalizedRequest;
+}
 import type { ContextManager, TokenBudget, ContextInjection, CompileResult } from '@connectome/context-manager';
 import type {
   AgentConfig,
@@ -233,7 +238,7 @@ export class Agent {
   async startStream(
     availableTools: ToolDefinition[],
     budget?: TokenBudget
-  ): Promise<YieldingStream> {
+  ): Promise<StartStreamResult> {
     return this.startStreamWithInjections(availableTools, undefined, budget);
   }
 
@@ -245,7 +250,7 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget
-  ): Promise<YieldingStream> {
+  ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
@@ -261,6 +266,7 @@ export class Agent {
         temperature: this.temperature,
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
+      promptCaching: true,
     };
 
     const stream = this.membrane.streamYielding(request, {
@@ -270,7 +276,7 @@ export class Agent {
     });
 
     this._state = { status: 'streaming', stream };
-    return stream;
+    return { stream, request };
   }
 
   /**

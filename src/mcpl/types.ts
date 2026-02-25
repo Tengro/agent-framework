@@ -546,6 +546,8 @@ export interface AfterInferenceParams {
   usage: {
     inputTokens: number;
     outputTokens: number;
+    cacheCreationTokens?: number;
+    cacheReadTokens?: number;
   };
 }
 
