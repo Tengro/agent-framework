@@ -148,14 +148,15 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel',
+    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to' },
+        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the most recent incoming channel)' },
         content: { type: 'string', description: 'Text content to publish' },
+        text: { type: 'string', description: 'Alias for content' },
       },
-      required: ['channelId', 'content'],
+      required: [],
     },
   },
 ];
@@ -757,12 +758,32 @@ export class ChannelRegistry {
     }
   }
 
-  private async handleToolPublish(input: { channelId: string; content: string }): Promise<ToolResult> {
-    const entry = this.findChannelEntry(input.channelId);
+  private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
+    // Resolve content: accept both `content` and `text` (backward compat)
+    const messageText = input.content ?? input.text;
+    if (!messageText) {
+      return {
+        success: false,
+        error: 'Either content or text parameter is required',
+        isError: true,
+      };
+    }
+
+    // Resolve channelId: default to most recent incoming channel
+    const channelId = input.channelId ?? this.defaultPublishChannel;
+    if (!channelId) {
+      return {
+        success: false,
+        error: 'No channelId specified and no default channel available',
+        isError: true,
+      };
+    }
+
+    const entry = this.findChannelEntry(channelId);
     if (!entry) {
       return {
         success: false,
-        error: `Channel not found: ${input.channelId}`,
+        error: `Channel not found: ${channelId}`,
         isError: true,
       };
     }
@@ -779,8 +800,8 @@ export class ChannelRegistry {
     try {
       const publishParams: ChannelsPublishParams = {
         conversationId: '', // Framework will fill this when wired
-        channelId: input.channelId,
-        content: [{ type: 'text', text: input.content }],
+        channelId,
+        content: [{ type: 'text', text: messageText }],
       };
 
       const result = await server.sendChannelsPublish(publishParams);

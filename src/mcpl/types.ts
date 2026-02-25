@@ -210,6 +210,18 @@ export interface McplServerConfig {
    * If not provided, all incoming messages trigger inference.
    */
   shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+
+  /**
+   * Tool name prefix for this server's tools.
+   * Tools are exposed as `{toolPrefix}:{toolName}`.
+   *
+   * Default: `mcpl:{id}` (e.g., `mcpl:zk:lobby_start_game`).
+   * Set to the server ID for cleaner names (e.g., `toolPrefix: 'zk'`
+   * gives `zk:lobby_start_game`).
+   *
+   * Must not collide with any module name or another server's prefix.
+   */
+  toolPrefix?: string;
 }
 
 // ============================================================================

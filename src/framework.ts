@@ -43,7 +43,7 @@ import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { ScopeManager } from './mcpl/scope-manager.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
-import { PushHandler } from './mcpl/push-handler.js';
+import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry } from './mcpl/channel-registry.js';
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
@@ -133,6 +133,10 @@ export class AgentFramework {
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
+  /** Maps tool prefix → serverId for dispatch routing. */
+  private mcplPrefixMap: Map<string, string> = new Map();
+  /** Maps serverId → McplServerConfig for prefix lookup. */
+  private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
 
   private constructor(
     store: JsStore,
@@ -243,6 +247,25 @@ export class AgentFramework {
 
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
+      // Validate tool prefixes: no collisions with module names or between servers
+      const moduleNames = new Set(config.modules.map(m => m.name));
+      const prefixesSeen = new Map<string, string>(); // prefix → serverId
+      for (const serverConfig of config.mcplServers) {
+        const prefix = serverConfig.toolPrefix ?? `mcpl:${serverConfig.id}`;
+        if (moduleNames.has(prefix)) {
+          throw new Error(
+            `MCPL server "${serverConfig.id}" toolPrefix "${prefix}" collides with module "${prefix}"`
+          );
+        }
+        const existing = prefixesSeen.get(prefix);
+        if (existing) {
+          throw new Error(
+            `MCPL server "${serverConfig.id}" toolPrefix "${prefix}" collides with server "${existing}"`
+          );
+        }
+        prefixesSeen.set(prefix, serverConfig.id);
+      }
+
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -413,6 +436,46 @@ export class AgentFramework {
    */
   getStore(): JsStore {
     return this.store;
+  }
+
+  /**
+   * Get the Membrane instance.
+   */
+  getMembrane(): Membrane {
+    return this.membrane;
+  }
+
+  /**
+   * Create an ephemeral agent that is NOT registered in the main event loop.
+   *
+   * Used by SubagentModule (and similar) to create short-lived agents
+   * that are driven externally (not by the framework's event loop).
+   * The returned agent has its own ContextManager on a unique namespace
+   * but shares the same Chronicle store.
+   *
+   * Call cleanup() when done to release resources.
+   */
+  async createEphemeralAgent(config: AgentConfig): Promise<{
+    agent: Agent;
+    contextManager: ContextManager;
+    cleanup: () => void;
+  }> {
+    const namespace = `ephemeral/${config.name}`;
+    const contextManager = await ContextManager.open({
+      store: this.store,
+      namespace,
+      strategy: config.strategy ?? new PassthroughStrategy(),
+      membrane: this.membrane,
+    });
+
+    const agent = new Agent(config, contextManager, this.membrane);
+
+    const cleanup = () => {
+      // Context manager cleanup is minimal — it doesn't own the store
+      // The namespace data remains in Chronicle (harmless, can be GC'd later)
+    };
+
+    return { agent, contextManager, cleanup };
   }
 
   /**
@@ -744,6 +807,26 @@ export class AgentFramework {
   private async handleProcessEvent(event: ProcessEvent): Promise<void> {
     const startTime = Date.now();
 
+    // Built-in: convert MCPL events to context messages.
+    // These events are protocol-level (spec Sections 9 & 14) and always
+    // represent content intended for the model's context window.
+    if (event.type === 'mcpl:channel-incoming') {
+      this.handleMcplChannelIncoming(event as unknown as {
+        type: 'mcpl:channel-incoming';
+        serverId: string;
+        channelId: string;
+        messageId: string;
+        threadId?: string;
+        author: { id: string; name: string };
+        content: ContentBlock[];
+        timestamp: string;
+        metadata?: Record<string, unknown>;
+        triggerInference?: boolean;
+      });
+    } else if (event.type === 'mcpl:push-event') {
+      this.handleMcplPushEvent(event as unknown as McplPushEvent);
+    }
+
     // Dispatch to all modules, tracking responses with module names
     const responses: ModuleProcessResponse[] = [];
     for (const module of this.moduleRegistry.getAllModules()) {
@@ -881,6 +964,79 @@ export class AgentFramework {
             timestamp: Date.now(),
           });
         }
+      }
+    }
+  }
+
+  // ==========================================================================
+  // Built-in MCPL event → context message conversion
+  // ==========================================================================
+
+  /**
+   * Convert an incoming MCPL channel message to a context message.
+   * This replaces the old MCPLModule.onProcess() message conversion.
+   */
+  private handleMcplChannelIncoming(event: {
+    type: 'mcpl:channel-incoming';
+    serverId: string;
+    channelId: string;
+    messageId: string;
+    threadId?: string;
+    author: { id: string; name: string };
+    content: ContentBlock[];
+    timestamp: string;
+    metadata?: Record<string, unknown>;
+    triggerInference?: boolean;
+  }): void {
+    const metadata: Record<string, unknown> = {
+      ...event.metadata,
+      channelId: event.channelId,
+      messageId: event.messageId,
+      author: event.author,
+      triggered: event.triggerInference ?? false,
+      serverId: event.serverId,
+    };
+    if (event.threadId) metadata.threadId = event.threadId;
+
+    const id = this.addMessage('user', event.content, metadata);
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+
+    if (event.triggerInference) {
+      for (const agentName of this.agents.keys()) {
+        this.pendingRequests.push({
+          agentName,
+          reason: 'mcpl:channel-incoming',
+          source: event.serverId,
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Convert an MCPL push event to a context message.
+   */
+  private handleMcplPushEvent(event: McplPushEvent): void {
+    const metadata: Record<string, unknown> = {
+      ...event.origin,
+      serverId: event.serverId,
+      featureSet: event.featureSet,
+      eventId: event.eventId,
+      triggered: event.triggerInference ?? false,
+    };
+
+    const id = this.addMessage('user', event.content, metadata);
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+
+    if (event.triggerInference) {
+      const targetAgents = event.targetAgents ?? [...this.agents.keys()];
+      for (const agentName of targetAgents) {
+        this.pendingRequests.push({
+          agentName,
+          reason: 'mcpl:push-event',
+          source: event.serverId,
+          timestamp: Date.now(),
+        });
       }
     }
   }
@@ -1201,6 +1357,54 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * Execute a tool call and return the result.
+   * Routes to the appropriate handler (module registry or MCPL).
+   * Used by SubagentModule to dispatch tool calls for ephemeral agents.
+   */
+  async executeToolCall(call: ToolCall): Promise<ToolResult> {
+    // MCPL tools are dispatched via the MCPL subsystem
+    if (this.mcplServerRegistry) {
+      // Check if this is an MCPL-prefixed tool
+      const prefix = call.name.split(':').slice(0, -1).join(':');
+      const serverConfigs = this.mcplServerConfigs;
+      for (const [, config] of serverConfigs) {
+        const toolPrefix = config.toolPrefix ?? `mcpl:${config.id}`;
+        if (call.name.startsWith(toolPrefix + ':')) {
+          return this.executeMcplToolCall(call, config);
+        }
+      }
+    }
+
+    // Module tools
+    return this.moduleRegistry.handleToolCall(call);
+  }
+
+  private async executeMcplToolCall(call: ToolCall, config: McplServerConfig): Promise<ToolResult> {
+    if (!this.mcplServerRegistry) {
+      return { success: false, error: 'MCPL not initialized', isError: true };
+    }
+    const server = this.mcplServerRegistry.getServer(config.id);
+    if (!server) {
+      return { success: false, error: `MCPL server ${config.id} not found`, isError: true };
+    }
+    const prefix = config.toolPrefix ?? `mcpl:${config.id}`;
+    const toolName = call.name.slice(prefix.length + 1); // Strip prefix + ':'
+    try {
+      const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
+      return {
+        success: true,
+        data: result.content,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+        isError: true,
+      };
+    }
+  }
+
   private toMembraneToolResult(callId: string, afResult: ToolResult): MembraneToolResult {
     return {
       toolUseId: callId,
@@ -1265,10 +1469,24 @@ export class AgentFramework {
     this.store.setStateJson(PROCESS_LOG_ID, entries);
   }
 
+  /**
+   * Find the MCPL server for a tool call by checking against the prefix map.
+   * Returns [serverId, prefix] if found, null otherwise.
+   */
+  private resolveMcplTool(toolName: string): [string, string] | null {
+    for (const [prefix, serverId] of this.mcplPrefixMap) {
+      if (toolName.startsWith(prefix + ':')) {
+        return [serverId, prefix];
+      }
+    }
+    return null;
+  }
+
   private dispatchToolCall(agentName: string, call: ToolCall): void {
-    // Route MCPL tool calls to the appropriate server
-    if (call.name.startsWith('mcpl:') && this.mcplServerRegistry) {
-      this.dispatchMcplToolCall(agentName, call);
+    // Route MCPL tool calls to the appropriate server via prefix map
+    const mcplMatch = this.resolveMcplTool(call.name);
+    if (mcplMatch && this.mcplServerRegistry) {
+      this.dispatchMcplToolCall(agentName, call, mcplMatch[0], mcplMatch[1]);
       return;
     }
 
@@ -1432,11 +1650,22 @@ export class AgentFramework {
     this.scopeManager = new ScopeManager();
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
 
+    // Build prefix map and store configs for tool routing
+    for (const config of serverConfigs) {
+      const prefix = config.toolPrefix ?? `mcpl:${config.id}`;
+      this.mcplPrefixMap.set(prefix, config.id);
+      this.mcplServerConfigs.set(config.id, config);
+    }
+
+    // Find shouldTriggerInference callback from server configs (first one wins)
+    const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference;
+
     // Push events handler (Step 6)
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      triggerFilter,
     );
 
     // Server-initiated inference router (Step 6)
@@ -1459,9 +1688,6 @@ export class AgentFramework {
     );
 
     // Channel registry (Step 7)
-    // Find shouldTriggerInference callback from server configs (first one wins)
-    const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference;
-
     this.channelRegistry = new ChannelRegistry(
       this.mcplServerRegistry,
       this.featureSetManager,
@@ -1634,7 +1860,7 @@ export class AgentFramework {
 
   /**
    * Discover tools from all connected MCPL servers and cache them.
-   * Tools are namespaced as `mcpl:{serverId}:{toolName}`.
+   * Tools are namespaced as `{toolPrefix}:{toolName}` per server config.
    */
   private async refreshMcplTools(): Promise<void> {
     if (!this.mcplServerRegistry) return;
@@ -1642,13 +1868,15 @@ export class AgentFramework {
     const tools: import('./types/index.js').ToolDefinition[] = [];
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
+      const config = this.mcplServerConfigs.get(server.id);
+      const prefix = config?.toolPrefix ?? `mcpl:${server.id}`;
       try {
         const result = await server.sendToolsList();
         for (const tool of result.tools) {
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
           tools.push({
-            name: `mcpl:${server.id}:${tool.name}`,
+            name: `${prefix}:${tool.name}`,
             description: tool.description ?? '',
             inputSchema: schema,
           });
@@ -1717,24 +1945,10 @@ export class AgentFramework {
 
   /**
    * Dispatch a tool call to an MCPL server.
-   * Parses `mcpl:{serverId}:{toolName}` and routes accordingly.
+   * Strips the configured toolPrefix and routes to the server.
    */
-  private dispatchMcplToolCall(agentName: string, call: ToolCall): void {
-    // Parse mcpl:{serverId}:{toolName}
-    const parts = call.name.split(':');
-    if (parts.length < 3) {
-      this.pushEvent({
-        type: 'tool-result',
-        callId: call.id,
-        agentName,
-        moduleName: 'mcpl',
-        result: { success: false, error: `Invalid MCPL tool name: ${call.name}`, isError: true },
-      });
-      return;
-    }
-
-    const serverId = parts[1];
-    const toolName = parts.slice(2).join(':'); // Handle tool names that contain colons
+  private dispatchMcplToolCall(agentName: string, call: ToolCall, serverId: string, prefix: string): void {
+    const toolName = call.name.slice(prefix.length + 1); // strip "{prefix}:"
     const server = this.mcplServerRegistry!.getServer(serverId);
 
     if (!server) {
