@@ -166,6 +166,7 @@ export class Agent {
         temperature: this.temperature,
       },
       tools: tools.length > 0 ? tools : undefined,
+      assistantParticipant: this.name,
     };
 
     // Set state to inferring
@@ -267,6 +268,7 @@ export class Agent {
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: true,
+      assistantParticipant: this.name,
     };
 
     const stream = this.membrane.streamYielding(request, {
