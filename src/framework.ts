@@ -488,6 +488,94 @@ export class AgentFramework {
   }
 
   /**
+   * Run an ephemeral agent to completion through the framework's event loop.
+   *
+   * The agent is temporarily registered, inference is triggered, and the
+   * framework drives the stream (emitting traces, logging, dispatching tools).
+   * Returns the agent's speech output when it finishes (no more tool calls).
+   *
+   * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
+   * The task message should already be in the context manager.
+   */
+  async runEphemeralToCompletion(
+    agent: Agent,
+    contextManager: ContextManager,
+  ): Promise<{ speech: string; toolCallsCount: number }> {
+    // Register temporarily so the event loop can drive it
+    this.agents.set(agent.name, agent);
+
+    return new Promise<{ speech: string; toolCallsCount: number }>((resolve, reject) => {
+      let speech = '';
+      let toolCallsCount = 0;
+      let settled = false;
+
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        this.offTrace(traceListener);
+        this.agents.delete(agent.name);
+      };
+
+      const traceListener = (event: TraceEvent) => {
+        if (settled) return;
+        // Only track events for our ephemeral agent
+        const agentName = 'agentName' in event ? (event as { agentName: string }).agentName : null;
+        if (agentName !== agent.name) return;
+
+        switch (event.type) {
+          case 'inference:tokens': {
+            const content = (event as { content?: string }).content;
+            if (content) speech += content;
+            break;
+          }
+          case 'inference:tool_calls_yielded': {
+            const calls = (event as { calls?: Array<unknown> }).calls;
+            if (calls) toolCallsCount += calls.length;
+            // Reset speech buffer — tool calls break the text
+            speech = '';
+            break;
+          }
+          case 'inference:stream_resumed':
+            speech = '';
+            break;
+          case 'inference:completed': {
+            // Check if agent is idle (no pending tool calls = truly done)
+            // If tools were called, the agent will cycle through waiting_for_tools → ready → streaming
+            // and eventually complete again. We only resolve when there are no more tool calls.
+            if (agent.state.status === 'idle') {
+              cleanup();
+              resolve({ speech, toolCallsCount });
+            }
+            break;
+          }
+          case 'inference:turn_ended': {
+            // endTurn from a tool result — agent is done
+            cleanup();
+            resolve({ speech, toolCallsCount });
+            break;
+          }
+          case 'inference:failed': {
+            const error = (event as { error?: string }).error ?? 'Unknown error';
+            cleanup();
+            reject(new Error(error));
+            break;
+          }
+        }
+      };
+
+      this.onTrace(traceListener);
+
+      // Trigger inference
+      this.pendingRequests.push({
+        agentName: agent.name,
+        reason: 'ephemeral',
+        source: 'subagent',
+        timestamp: Date.now(),
+      });
+    });
+  }
+
+  /**
    * Get queue depth.
    */
   getQueueDepth(): number {
