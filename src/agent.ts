@@ -1,5 +1,10 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from 'membrane';
-import type { ContextManager, TokenBudget } from '@connectome/context-manager';
+
+export interface StartStreamResult {
+  stream: YieldingStream;
+  request: NormalizedRequest;
+}
+import type { ContextManager, TokenBudget, ContextInjection, CompileResult } from '@connectome/context-manager';
 import type {
   AgentConfig,
   AgentState,
@@ -26,6 +31,9 @@ export class Agent {
   readonly temperature: number;
 
   private _state: AgentState = { status: 'idle' };
+  private _streamId = 0;
+  lastStreamInputTokens = 0;
+  maxStreamTokens: number;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -41,6 +49,7 @@ export class Agent {
     this.triggerSources = config.triggerSources ?? 'all';
     this.maxTokens = config.maxTokens ?? 4096;
     this.temperature = config.temperature ?? 1;
+    this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextManager = contextManager;
     this.membrane = membrane;
   }
@@ -50,6 +59,14 @@ export class Agent {
    */
   get state(): AgentState {
     return this._state;
+  }
+
+  /**
+   * Monotonically increasing stream generation counter.
+   * Used to guard stale driveStream handlers after a budget restart.
+   */
+  get streamId(): number {
+    return this._streamId;
   }
 
   /**
@@ -83,12 +100,53 @@ export class Agent {
     return this.triggerSources.includes(source);
   }
 
+  // ==========================================================================
+  // Composable Steps
+  // ==========================================================================
+
+  /**
+   * Compile the context without injections.
+   * Step 1 of the inference pipeline — callers can inspect/modify the result
+   * before building a request.
+   */
+  async compileContext(budget?: TokenBudget): Promise<CompileResult> {
+    return this.contextManager.compile(budget);
+  }
+
+  /**
+   * Compile the context with injections.
+   * Same as compileContext but forwards injections (e.g. from MCPL servers)
+   * to the context manager so they are merged into the compiled messages.
+   */
+  async compileWithInjections(
+    budget?: TokenBudget,
+    injections?: ContextInjection[]
+  ): Promise<CompileResult> {
+    return this.contextManager.compile(budget, injections);
+  }
+
+  // ==========================================================================
+  // Inference (backward-compatible)
+  // ==========================================================================
+
   /**
    * Run inference and return result with tool calls and speech content.
    * Updates agent state during execution.
    */
   async runInference(
     availableTools: ToolDefinition[],
+    budget?: TokenBudget
+  ): Promise<InferenceResult> {
+    return this.runInferenceWithInjections(availableTools, undefined, budget);
+  }
+
+  /**
+   * Run inference with context injections.
+   * Same as runInference but passes injections through to compile.
+   */
+  async runInferenceWithInjections(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
     budget?: TokenBudget
   ): Promise<InferenceResult> {
     if (this._state.status === 'inferring') {
@@ -102,8 +160,8 @@ export class Agent {
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
 
-    // Build request
-    const messages = await this.contextManager.compile(budget);
+    // Compile context (with optional injections)
+    const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 
     // If we have pending tool results, add them
     if (this._state.status === 'ready') {
@@ -113,13 +171,14 @@ export class Agent {
 
     const request: NormalizedRequest = {
       messages,
-      system: this.systemPrompt,
+      system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
         maxTokens: this.maxTokens,
         temperature: this.temperature,
       },
       tools: tools.length > 0 ? tools : undefined,
+      assistantParticipant: this.name,
     };
 
     // Set state to inferring
@@ -192,22 +251,39 @@ export class Agent {
   async startStream(
     availableTools: ToolDefinition[],
     budget?: TokenBudget
-  ): Promise<YieldingStream> {
+  ): Promise<StartStreamResult> {
+    return this.startStreamWithInjections(availableTools, undefined, budget);
+  }
+
+  /**
+   * Start a yielding stream with context injections.
+   * Same as startStream but passes injections through to compile.
+   */
+  async startStreamWithInjections(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
+    budget?: TokenBudget
+  ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
 
-    const messages = await this.contextManager.compile(budget);
+    this._streamId++;
+    this.lastStreamInputTokens = 0;
+
+    const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 
     const request: NormalizedRequest = {
       messages,
-      system: this.systemPrompt,
+      system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
         maxTokens: this.maxTokens,
         temperature: this.temperature,
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
+      promptCaching: true,
+      assistantParticipant: this.name,
     };
 
     const stream = this.membrane.streamYielding(request, {
@@ -217,7 +293,7 @@ export class Agent {
     });
 
     this._state = { status: 'streaming', stream };
-    return stream;
+    return { stream, request };
   }
 
   /**
@@ -293,6 +369,25 @@ export class Agent {
    */
   getContextManager(): ContextManager {
     return this.contextManager;
+  }
+
+  /**
+   * Build the effective system prompt, appending any system-position injections.
+   */
+  private buildSystemPrompt(systemInjections: ContentBlock[]): string {
+    if (systemInjections.length === 0) {
+      return this.systemPrompt;
+    }
+
+    const injectedText = systemInjections
+      .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text')
+      .map((block) => block.text);
+
+    if (injectedText.length === 0) {
+      return this.systemPrompt;
+    }
+
+    return this.systemPrompt + '\n' + injectedText.join('\n');
   }
 
   private async doInference(request: NormalizedRequest): Promise<InferenceResult> {

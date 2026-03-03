@@ -55,7 +55,7 @@ export interface InferenceLogSummary {
   success: boolean;
   error?: string;
   durationMs: number;
-  tokenUsage?: { input: number; output: number };
+  tokenUsage?: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
   stopReason?: string;
   /** Whether request is stored as blob */
   requestIsBlob: boolean;

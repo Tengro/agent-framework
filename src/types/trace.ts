@@ -41,13 +41,18 @@ export type TraceEvent =
       type: 'inference:completed';
       agentName: string;
       durationMs: number;
-      tokenUsage?: { input: number; output: number };
+      tokenUsage?: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
     })
   | (TraceEventBase & {
       type: 'inference:failed';
       agentName: string;
       error: string;
       stack?: string;
+    })
+  | (TraceEventBase & {
+      type: 'inference:exhausted';
+      agentName: string;
+      error: string;
     })
 
   // Streaming inference lifecycle
@@ -59,10 +64,26 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:tool_calls_yielded';
       agentName: string;
-      calls: Array<{ id: string; name: string }>;
+      calls: Array<{ id: string; name: string; input?: unknown }>;
+    })
+  | (TraceEventBase & {
+      type: 'inference:usage';
+      agentName: string;
+      tokenUsage: { input: number; output: number };
     })
   | (TraceEventBase & {
       type: 'inference:stream_resumed';
+      agentName: string;
+    })
+  | (TraceEventBase & {
+      type: 'inference:stream_restarted';
+      agentName: string;
+      reason: string;
+      inputTokens: number;
+      budget: number;
+    })
+  | (TraceEventBase & {
+      type: 'inference:turn_ended';
       agentName: string;
     })
 
@@ -72,6 +93,7 @@ export type TraceEvent =
       module: string;
       tool: string;
       callId: string;
+      input?: unknown;
     })
   | (TraceEventBase & {
       type: 'tool:completed';
