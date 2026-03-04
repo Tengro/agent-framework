@@ -504,13 +504,31 @@ export class AgentFramework {
       let speech = '';
       let toolCallsCount = 0;
       let settled = false;
+      let inferenceStarted = false;
+
+      const STARTUP_TIMEOUT_MS = 30_000;
 
       const cleanup = () => {
         if (settled) return;
         settled = true;
+        clearTimeout(startupWatchdog);
         this.offTrace(traceListener);
         this.agents.delete(agent.name);
       };
+
+      // Watchdog: if inference never starts within 30s, the agent is a zombie.
+      // This catches cases where the event loop stalled, the agent was
+      // deregistered, or processInferenceRequests() skipped the request.
+      const startupWatchdog = setTimeout(() => {
+        if (!inferenceStarted && !settled) {
+          cleanup();
+          reject(new Error(
+            `Ephemeral agent "${agent.name}" failed to start inference within ` +
+            `${STARTUP_TIMEOUT_MS}ms — zombie detected. The event loop may have ` +
+            `stalled or the inference request was dropped.`
+          ));
+        }
+      }, STARTUP_TIMEOUT_MS);
 
       const traceListener = (event: TraceEvent) => {
         if (settled) return;
@@ -519,7 +537,11 @@ export class AgentFramework {
         if (agentName !== agent.name) return;
 
         switch (event.type) {
+          case 'inference:started':
+            inferenceStarted = true;
+            break;
           case 'inference:tokens': {
+            inferenceStarted = true;
             const content = (event as { content?: string }).content;
             if (content) speech += content;
             break;
@@ -1178,6 +1200,8 @@ export class AgentFramework {
       return;
     }
 
+    const STALE_REQUEST_MS = 30_000;
+    const now = Date.now();
     const state = this.createFrameworkState();
 
     // Group requests by agent
@@ -1194,11 +1218,32 @@ export class AgentFramework {
     // Check each agent
     for (const [agentName, requests] of requestsByAgent) {
       const agent = this.agents.get(agentName);
-      if (!agent) continue;
+      if (!agent) {
+        // Agent not found — request is orphaned. Emit warning and drop.
+        const oldest = Math.min(...requests.map(r => r.timestamp));
+        this.emitTrace({
+          type: 'inference:request_dropped',
+          agentName,
+          reason: 'agent_not_found',
+          requestCount: requests.length,
+          oldestRequestAge: now - oldest,
+        });
+        continue;
+      }
 
       // Skip if agent is busy (inferring, streaming, or waiting for tools)
       if (agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
-        // Re-queue requests
+        // Re-queue requests, but warn if they've been pending too long
+        const oldest = Math.min(...requests.map(r => r.timestamp));
+        if (now - oldest > STALE_REQUEST_MS) {
+          this.emitTrace({
+            type: 'inference:request_stale',
+            agentName,
+            agentStatus: agent.state.status,
+            requestCount: requests.length,
+            oldestRequestAge: now - oldest,
+          });
+        }
         this.pendingRequests.push(...requests);
         continue;
       }
