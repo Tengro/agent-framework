@@ -30,6 +30,7 @@ import type {
   EventResponse,
   ModuleProcessResponse,
   ToolCall,
+  ToolCallEvent,
   ToolResult,
   AgentConfig,
   InferenceRequest,
@@ -427,6 +428,21 @@ export class AgentFramework {
    */
   getAllAgents(): Agent[] {
     return Array.from(this.agents.values());
+  }
+
+  /**
+   * Abort an in-flight inference for an agent.
+   */
+  abortInference(agentName: string, reason?: string): boolean {
+    const agent = this.agents.get(agentName);
+    if (!agent) {
+      return false;
+    }
+    const aborted = agent.abortInference(reason);
+    if (aborted) {
+      this.emitTrace({ type: 'inference:aborted', agentName, reason });
+    }
+    return aborted;
   }
 
   /**
@@ -1258,6 +1274,11 @@ export class AgentFramework {
       }
     }
 
+    // Handle tool calls specially
+    if (event.type === 'tool-call') {
+      this.dispatchToolCallEvent(event);
+    }
+
     const durationMs = Date.now() - startTime;
 
     // Always emit trace for observability (UI needs this)
@@ -1939,7 +1960,21 @@ export class AgentFramework {
 
     const colonIndex = enrichedCall.name.indexOf(':');
     const moduleName = colonIndex >= 0 ? enrichedCall.name.substring(0, colonIndex) : 'unknown';
+    const toolName = colonIndex >= 0 ? call.name.substring(colonIndex + 1) : call.name;
 
+    this.pushEvent({
+      type: 'tool-call',
+      callId: call.id,
+      agentName,
+      moduleName,
+      toolName,
+      call,
+    });
+  }
+
+
+  private dispatchToolCallEvent(event: ToolCallEvent): void {
+    const { call, agentName, moduleName } = event;
     this.emitTrace({
       type: 'tool:started',
       module: moduleName,
@@ -1950,7 +1985,6 @@ export class AgentFramework {
 
     const startTime = Date.now();
 
-    // Execute tool asynchronously
     this.moduleRegistry
       .handleToolCall(enrichedCall)
       .then((result) => {
@@ -1963,7 +1997,6 @@ export class AgentFramework {
           durationMs,
         });
 
-        // Push result to queue
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
@@ -1983,7 +2016,6 @@ export class AgentFramework {
           stack: err.stack,
         });
 
-        // Push error result to queue
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
