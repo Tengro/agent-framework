@@ -3,12 +3,12 @@
  *
  * Reads policies from a `gate.json` config file. Policies are evaluated in
  * order — first match wins. Each policy specifies a behavior: "always"
- * (trigger immediately), "suppress" (drop), "observe" (add to context only),
- * or { debounce: ms } (batch events per-policy, deliver when timer fires).
+ * (trigger immediately), "skip" (don't trigger), or { debounce: ms }
+ * (batch events per-policy, deliver when timer fires).
  *
- * The gate controls inference triggering only. Modules always see all events
- * via onProcess. Context inclusion is driven by message metadata
- * (metadata.triggered) and is the context strategy's responsibility.
+ * The gate controls inference triggering only. Events always enter context
+ * and are always dispatched to modules — the gate decides whether to spend
+ * inference tokens, not whether the agent should know about the event.
  */
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -117,8 +117,8 @@ function validateConfig(raw: unknown): GateConfig {
   const obj = raw as Record<string, unknown>;
 
   const defaultBehavior = obj.default ?? 'always';
-  if (defaultBehavior !== 'always' && defaultBehavior !== 'suppress') {
-    throw new Error(`gate.json "default" must be "always" or "suppress", got: ${defaultBehavior}`);
+  if (defaultBehavior !== 'always' && defaultBehavior !== 'skip') {
+    throw new Error(`gate.json "default" must be "always" or "skip", got: ${defaultBehavior}`);
   }
 
   const policies: GatePolicy[] = [];
@@ -144,7 +144,7 @@ function validatePolicy(raw: unknown): GatePolicy {
 
   // Validate behavior
   let behavior: GateBehavior;
-  if (obj.behavior === 'always' || obj.behavior === 'suppress' || obj.behavior === 'observe') {
+  if (obj.behavior === 'always' || obj.behavior === 'skip') {
     behavior = obj.behavior;
   } else if (obj.behavior && typeof obj.behavior === 'object') {
     const b = obj.behavior as Record<string, unknown>;
@@ -251,7 +251,6 @@ export class EventGate {
 
   private loadConfig(): GateConfig | null {
     if (!existsSync(this.configPath)) {
-      this.configSource = this.configSource === 'default' ? 'default' : this.configSource;
       return null;
     }
     try {
@@ -418,12 +417,8 @@ export class EventGate {
       timestamp: Date.now(),
     });
 
-    if (policy.behavior === 'suppress') {
-      return { trigger: false, policyName: policy.name, behavior: 'suppress' };
-    }
-
-    if (policy.behavior === 'observe') {
-      return { trigger: false, policyName: policy.name, behavior: 'observe' };
+    if (policy.behavior === 'skip') {
+      return { trigger: false, policyName: policy.name, behavior: 'skip' };
     }
 
     if (policy.behavior === 'always') {
@@ -493,9 +488,9 @@ export class EventGate {
     const events = state.events;
     this.debounceTimers.delete(policyName);
 
-    // If any agent is currently inferring, buffer for later
+    // If any agent is currently inferring, buffer for later (with cap)
     if (this.inferring.size > 0) {
-      this.inferenceBuffer.push(...events);
+      this.bufferForInference(events);
       return;
     }
 

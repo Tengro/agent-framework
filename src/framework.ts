@@ -36,6 +36,7 @@ import type {
   InferenceRequest,
   AgentState,
   Module,
+  SpeechContext,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
@@ -1811,6 +1812,9 @@ export class AgentFramework {
             // pendingAssistantBlocks and flushed when tool results arrived.
             // Only store trailing content (text after the last tool round) to
             // avoid double-storing tool_use blocks.
+            const hadToolCalls = response.content.some(
+              (b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'
+            );
             if (hadToolCalls) {
               // Filter to only trailing text/thinking blocks (no tool_use — those are already stored)
               const trailingContent = response.content.filter(
@@ -1858,11 +1862,16 @@ export class AgentFramework {
               }
             }
 
-            // Extract speech content
-            const speechContent = response.content.filter(
-              (block: ContentBlock): block is ContentBlock & { type: 'text' } =>
-                block.type === 'text'
-            );
+            // Separate speech from thoughts.
+            // When tools were used, ALL text is thoughts (the tools themselves are
+            // the agent's actions — surrounding text is just reasoning).
+            // When no tools were used, all text is speech.
+            const isTextBlock = (block: ContentBlock): block is ContentBlock & { type: 'text' } =>
+              block.type === 'text';
+            const allText = response.content.filter(isTextBlock);
+
+            const speechContent = hadToolCalls ? [] : allText;
+            const thoughts = hadToolCalls ? allText : [];
 
             const tokenUsage = response.usage
               ? {
@@ -1892,15 +1901,16 @@ export class AgentFramework {
               stopReason: response.stopReason,
             });
 
-            // Dispatch speech
-            if (speechContent.length > 0) {
-              const speechContext = {
+            // Dispatch speech (and thoughts if any)
+            if (speechContent.length > 0 || thoughts.length > 0) {
+              const speechContext: SpeechContext = {
                 turnComplete: true,
                 trigger: trigger ?? {
                   reason: 'unknown',
                   source: 'unknown',
                   timestamp: Date.now(),
                 },
+                thoughts: thoughts.length > 0 ? thoughts : undefined,
               };
               await this.moduleRegistry.dispatchSpeech(
                 agent.name,

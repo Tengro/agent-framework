@@ -13,8 +13,7 @@
 /** How a matching policy affects inference triggering. */
 export type GateBehavior =
   | 'always'    // Trigger inference immediately
-  | 'suppress'  // Drop — no inference, no context
-  | 'observe'   // Add to context but don't trigger inference
+  | 'skip'      // Don't trigger inference (event still enters context)
   | { debounce: number };  // Batch events per-policy, deliver after delay (ms)
 
 // ---------------------------------------------------------------------------
@@ -52,7 +51,7 @@ export interface GatePolicy {
 export interface GateConfig {
   policies: GatePolicy[];
   /** Behavior when no policy matches. Default: 'always'. */
-  default?: 'always' | 'suppress';
+  default?: 'always' | 'skip';
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +106,7 @@ export interface GateStatus {
   configPath: string;
   configSource: 'file' | 'initial' | 'default';
   lastReloadTimestamp: number | null;
-  default: 'always' | 'suppress';
+  default: 'always' | 'skip';
   policies: GatePolicyStats[];
   errors: string[];
 }

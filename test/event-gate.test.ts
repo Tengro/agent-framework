@@ -80,10 +80,10 @@ describe('default behavior', () => {
     assert.strictEqual(decision.policyName, null);
   });
 
-  it('default: suppress → all suppressed', () => {
-    const path = writeConfig('suppress-default.json', {
+  it('default: skip → all skipped', () => {
+    const path = writeConfig('skip-default.json', {
       policies: [],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     const decision = gate.evaluate(event());
@@ -101,7 +101,7 @@ describe('policy matching', () => {
       policies: [
         { name: 'channels', match: { scope: ['channel:incoming'] }, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ eventType: 'channel:incoming' })).trigger, true);
@@ -113,7 +113,7 @@ describe('policy matching', () => {
       policies: [
         { name: 'zulip', match: { source: 'zulip' }, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ serverId: 'zulip' })).trigger, true);
@@ -125,7 +125,7 @@ describe('policy matching', () => {
       policies: [
         { name: 'any-zulip', match: { source: 'zulip-*' }, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ serverId: 'zulip-prod' })).trigger, true);
@@ -138,7 +138,7 @@ describe('policy matching', () => {
       policies: [
         { name: 'dev-channels', match: { channel: 'dev-*' }, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ channelId: 'dev-backend' })).trigger, true);
@@ -150,7 +150,7 @@ describe('policy matching', () => {
       policies: [
         { name: 'errors', match: { filter: { type: 'text', pattern: 'ERROR' } }, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ content: 'Something error happened' })).trigger, true);
@@ -162,7 +162,7 @@ describe('policy matching', () => {
       policies: [
         { name: 'deploys', match: { filter: { type: 'regex', pattern: 'deploy|rollback' } }, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ content: 'Starting deploy v2.3' })).trigger, true);
@@ -183,7 +183,7 @@ describe('policy matching', () => {
           behavior: 'always',
         },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     // All conditions met
@@ -215,10 +215,10 @@ describe('policy matching', () => {
   it('first match wins — order matters', () => {
     const path = writeConfig('order.json', {
       policies: [
-        { name: 'suppress-noise', match: { filter: { type: 'text', pattern: 'heartbeat' } }, behavior: 'suppress' },
+        { name: 'suppress-noise', match: { filter: { type: 'text', pattern: 'heartbeat' } }, behavior: 'skip' },
         { name: 'catch-all', match: {}, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ content: 'heartbeat ping' })).trigger, false);
@@ -230,7 +230,7 @@ describe('policy matching', () => {
       policies: [
         { name: 'catch-all', match: {}, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     assert.strictEqual(gate.evaluate(event({ serverId: 'any', channelId: 'any' })).trigger, true);
@@ -245,7 +245,7 @@ describe('behaviors', () => {
   it('always → trigger: true', () => {
     const path = writeConfig('always.json', {
       policies: [{ name: 'all', match: {}, behavior: 'always' }],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     const d = gate.evaluate(event());
@@ -253,27 +253,16 @@ describe('behaviors', () => {
     assert.strictEqual(d.behavior, 'always');
   });
 
-  it('suppress → trigger: false', () => {
-    const path = writeConfig('suppress.json', {
-      policies: [{ name: 'quiet', match: {}, behavior: 'suppress' }],
+  it('skip → trigger: false', () => {
+    const path = writeConfig('skip.json', {
+      policies: [{ name: 'quiet', match: {}, behavior: 'skip' }],
       default: 'always',
     });
     const { gate } = makeGate(path);
     const d = gate.evaluate(event());
     assert.strictEqual(d.trigger, false);
-    assert.strictEqual(d.behavior, 'suppress');
-  });
-
-  it('observe → trigger: false with observe behavior', () => {
-    const path = writeConfig('observe.json', {
-      policies: [{ name: 'watch', match: {}, behavior: 'observe' }],
-      default: 'suppress',
-    });
-    const { gate } = makeGate(path);
-    const d = gate.evaluate(event());
-    assert.strictEqual(d.trigger, false);
-    assert.strictEqual(d.behavior, 'observe');
-    assert.strictEqual(d.policyName, 'watch');
+    assert.strictEqual(d.behavior, 'skip');
+    assert.strictEqual(d.policyName, 'quiet');
   });
 });
 
@@ -287,7 +276,7 @@ describe('debounce', () => {
       policies: [
         { name: 'editor', match: { scope: ['push:event'] }, behavior: { debounce: 100 } },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     const d = gate.evaluate(event());
@@ -300,7 +289,7 @@ describe('debounce', () => {
       policies: [
         { name: 'editor', match: { scope: ['push:event'] }, behavior: { debounce: 150 } },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate, messages, inferenceRequests } = makeGate(path);
 
@@ -327,7 +316,7 @@ describe('debounce', () => {
       policies: [
         { name: 'editor', match: {}, behavior: { debounce: 150 } },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate, messages } = makeGate(path);
 
@@ -381,12 +370,48 @@ describe('debounce bounds', () => {
 // ---------------------------------------------------------------------------
 
 describe('inference buffering', () => {
+  it('inference buffer is capped at MAX_INFERENCE_BUFFER', async () => {
+    const path = writeConfig('infer-cap.json', {
+      policies: [
+        { name: 'chat', match: {}, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+    gate.onInferenceStarted('agent');
+
+    // Fire many debounce batches — each with 20 events, 6 batches = 120 events
+    for (let batch = 0; batch < 6; batch++) {
+      for (let i = 0; i < 20; i++) {
+        gate.evaluate(event({ content: `batch${batch}-msg${i}` }));
+      }
+      // Let debounce fire (into inference buffer since inferring)
+      await new Promise(r => setTimeout(r, 150));
+    }
+
+    // Buffer should be capped at 100 (oldest dropped)
+    const bufferLen = (gate as any).inferenceBuffer.length;
+    assert.ok(bufferLen <= 100, `Expected buffer <= 100, got ${bufferLen}`);
+    assert.ok(bufferLen > 0, 'Expected buffer to have events');
+
+    // First event should NOT be from batch 0 (those were dropped)
+    const firstEvent = (gate as any).inferenceBuffer[0];
+    assert.ok(!firstEvent.content.startsWith('batch0'), `Expected oldest events dropped, but first is ${firstEvent.content}`);
+
+    // End inference → flush
+    gate.onInferenceEnded('agent');
+    await new Promise(r => setTimeout(r, 10));
+
+    assert.strictEqual(messages.length, 1);
+    gate.dispose();
+  });
+
   it('debounce during inference → buffer → flush on end', async () => {
     const path = writeConfig('infer-debounce.json', {
       policies: [
         { name: 'chat', match: {}, behavior: { debounce: 150 } },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate, messages } = makeGate(path);
 
@@ -420,7 +445,7 @@ describe('config hot-reload', () => {
   it('reloads config when file changes', async () => {
     const path = writeConfig('reload.json', {
       policies: [{ name: 'all', match: {}, behavior: 'always' }],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
 
@@ -432,8 +457,8 @@ describe('config hot-reload', () => {
     // Wait for mtime to differ
     await new Promise(r => setTimeout(r, 50));
 
-    // Rewrite config — now suppress everything
-    writeFileSync(path, JSON.stringify({ policies: [], default: 'suppress' }));
+    // Rewrite config — now skip everything
+    writeFileSync(path, JSON.stringify({ policies: [], default: 'skip' }));
 
     assert.strictEqual(gate.evaluate(event()).trigger, false);
   });
@@ -441,7 +466,7 @@ describe('config hot-reload', () => {
   it('config error keeps previous valid config', async () => {
     const path = writeConfig('error-reload.json', {
       policies: [{ name: 'all', match: {}, behavior: 'always' }],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate, traces } = makeGate(path);
     assert.strictEqual(gate.evaluate(event()).trigger, true);
@@ -468,7 +493,7 @@ describe('config seeding', () => {
     const path = tmpPath('seeded.json');
     const config: GateConfig = {
       policies: [{ name: 'test', match: {}, behavior: 'always' }],
-      default: 'suppress',
+      default: 'skip',
     };
     makeGate(path, { initialConfig: config });
 
@@ -485,8 +510,8 @@ describe('config seeding', () => {
 
     makeGate(path, {
       initialConfig: {
-        policies: [{ name: 'new', match: {}, behavior: 'suppress' }],
-        default: 'suppress',
+        policies: [{ name: 'new', match: {}, behavior: 'skip' }],
+        default: 'skip',
       },
     });
 
@@ -506,7 +531,7 @@ describe('gate:status tool', () => {
         { name: 'always-policy', match: {}, behavior: 'always' },
         { name: 'debounce-policy', match: { scope: ['push:event'] }, behavior: { debounce: 1000 } },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
 
@@ -519,7 +544,7 @@ describe('gate:status tool', () => {
     const status = result.data!;
     assert.strictEqual(status.configPath, path);
     assert.strictEqual(status.configSource, 'file');
-    assert.strictEqual(status.default, 'suppress');
+    assert.strictEqual(status.default, 'skip');
     assert.strictEqual(status.policies.length, 2);
     assert.strictEqual(status.policies[0].name, 'always-policy');
     assert.strictEqual(status.policies[0].matchCount, 2);
@@ -537,7 +562,7 @@ describe('asShouldTriggerCallback', () => {
       policies: [
         { name: 'allow-zulip', match: { source: 'zulip' }, behavior: 'always' },
       ],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate } = makeGate(path);
     const cb = gate.asShouldTriggerCallback();
@@ -556,7 +581,7 @@ describe('trace events', () => {
   it('emits gate:policy-matched on match', () => {
     const path = writeConfig('trace-match.json', {
       policies: [{ name: 'test', match: {}, behavior: 'always' }],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate, traces } = makeGate(path);
     gate.evaluate(event());
@@ -576,7 +601,7 @@ describe('trace events', () => {
 
     (gate as any).lastReloadCheck = 0;
     await new Promise(r => setTimeout(r, 50));
-    writeFileSync(path, JSON.stringify({ policies: [{ name: 'new', match: {}, behavior: 'suppress' }], default: 'always' }));
+    writeFileSync(path, JSON.stringify({ policies: [{ name: 'new', match: {}, behavior: 'skip' }], default: 'always' }));
 
     gate.evaluate(event());
 
@@ -592,7 +617,7 @@ describe('dispose', () => {
   it('clears debounce timers without delivering', () => {
     const path = writeConfig('dispose.json', {
       policies: [{ name: 'debounced', match: {}, behavior: { debounce: 10000 } }],
-      default: 'suppress',
+      default: 'skip',
     });
     const { gate, messages } = makeGate(path);
     gate.evaluate(event());
