@@ -790,6 +790,31 @@ export class WorkspaceModule implements Module {
     };
   }
 
+  /**
+   * Programmatically materialize a mount's files from Chronicle tree to filesystem.
+   * Used after branch switches to refresh filesystem state.
+   * Resets branch tracking to allow cross-branch materialization.
+   */
+  async materializeMount(mountName: string): Promise<string[]> {
+    const store = this.getStore();
+    const mount = this.mounts.get(mountName);
+    if (!mount || mount.config.mode === 'read-only') return [];
+
+    // Reset tracking — we're deliberately materializing on the new branch
+    mount.lastMaterializedBranchId = null;
+    mount.lastMaterializedSeq = 0;
+
+    const watcher = this.watchers.get(mountName);
+    const written = await materializeToFs(store, mount);
+    for (const p of written) {
+      watcher?.suppress(p);
+    }
+    if (written.length > 0) {
+      mount.lastMaterializedBranchId = store.currentBranch().id;
+    }
+    return written;
+  }
+
   private async handleSync(input: SyncInput): Promise<ToolResult> {
     const store = this.getStore();
     const allResults: Array<{ mount: string; synced: string[]; conflicts: ConflictInfo[] }> = [];

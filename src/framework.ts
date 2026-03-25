@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { JsStore } from 'chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult } from 'membrane';
 import { ContextManager, PassthroughStrategy } from '@connectome/context-manager';
@@ -289,7 +290,7 @@ export class AgentFramework {
     if (config.gate) {
       const configPath = config.gate.configPath
         ?? (config.storePath
-          ? config.storePath.replace(/\/[^/]+$/, '/gate.json')
+          ? join(config.storePath, 'config', 'gate.json')
           : './data/gate.json');
       framework.eventGate = new EventGate({
         configPath,
@@ -513,6 +514,13 @@ export class AgentFramework {
    */
   getStore(): JsStore {
     return this.store;
+  }
+
+  /**
+   * Get a registered module by name.
+   */
+  getModule(name: string): Module | null {
+    return this.moduleRegistry.getModule(name);
   }
 
   /**
@@ -982,6 +990,12 @@ export class AgentFramework {
     this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
     this.store.switchBranch(undoBranchName);
 
+    // Materialize config files from the new branch (fire-and-forget; gate picks up via mtime)
+    const wsUndo = this.moduleRegistry.getModule('workspace');
+    if (wsUndo && 'materializeMount' in wsUndo) {
+      (wsUndo as any).materializeMount('_config').catch(() => {});
+    }
+
     // Push onto redo stack
     let redoStack = this.redoStacks.get(agentName);
     if (!redoStack) {
@@ -1034,6 +1048,12 @@ export class AgentFramework {
     const currentBranch = this.store.currentBranch();
 
     this.store.switchBranch(branchName);
+
+    // Materialize config files from the restored branch (fire-and-forget; gate picks up via mtime)
+    const wsRedo = this.moduleRegistry.getModule('workspace');
+    if (wsRedo && 'materializeMount' in wsRedo) {
+      (wsRedo as any).materializeMount('_config').catch(() => {});
+    }
 
     // Restore the checkpoint
     const checkpoints = this.getTurnCheckpoints(agentName);

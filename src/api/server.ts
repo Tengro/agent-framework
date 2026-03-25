@@ -468,6 +468,12 @@ export class ApiServer {
     store.switchBranch(params.name);
     this.currentBranch = params.name;
 
+    // Materialize config files from the new branch
+    const ws = this.framework.getModule('workspace');
+    if (ws && 'materializeMount' in ws) {
+      await (ws as any).materializeMount('_config');
+    }
+
     this.broadcast('branch:switched', {
       from: previousBranch,
       to: params.name,
