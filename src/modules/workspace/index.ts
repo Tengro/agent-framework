@@ -763,7 +763,7 @@ export class WorkspaceModule implements Module {
     for (const { name, mount } of mountsToMaterialize) {
 
       const paths = input.path
-        ? [this.parsePath(`${name}/${input.path}`).relativePath]
+        ? [this.parsePath(input.path).relativePath]
         : undefined;
 
       // Suppress watcher for paths we're about to write
@@ -808,7 +808,7 @@ export class WorkspaceModule implements Module {
     for (const { name, mount } of mountsToSync) {
 
       const paths = input.path
-        ? [this.parsePath(`${name}/${input.path}`).relativePath]
+        ? [this.parsePath(input.path).relativePath]
         : undefined;
 
       const result = await syncFromFs(store, mount, paths);
