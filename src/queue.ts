@@ -21,6 +21,9 @@ export class ProcessQueueImpl implements ProcessQueue {
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter(event);
+    } else if (event.type === 'external-message') {
+      // User input jumps to front so it's processed before queued internal events
+      this.queue.unshift(event);
     } else {
       this.queue.push(event);
     }
