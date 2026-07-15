@@ -171,7 +171,10 @@ export class McplServerConnection extends EventEmitter {
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
     for (const { event, args } of pending) {
-      super.emit(event, ...args);
+      // Re-enter the gate for every buffered item. A control handler (notably
+      // tools/list_changed) may install a newer data-plane barrier while this
+      // snapshot is being flushed; later data items must observe that pause.
+      this.emit(event, ...args);
     }
   }
 
@@ -568,6 +571,27 @@ export class McplServerConnection extends EventEmitter {
     }
 
     this.emit('close');
+  }
+
+  /**
+   * Tear down a live transport after an awareness-accounting failure without
+   * disabling configured auto-reconnect. The normal transport close handler
+   * rejects requests, emits lifecycle state, and schedules the next bounded
+   * reconnect attempt. With reconnect disabled this leaves the server closed.
+   */
+  async reconnectAfterFailure(): Promise<void> {
+    this.pauseDataPlane();
+    if (this.closed) {
+      this.scheduleReconnect();
+      return;
+    }
+    if (this.transport) {
+      await this.transport.close();
+      return;
+    }
+    this.closed = true;
+    this.emit('close');
+    this.scheduleReconnect();
   }
 
   /**

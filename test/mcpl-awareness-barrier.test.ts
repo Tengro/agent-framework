@@ -11,6 +11,7 @@ import {
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/framework.js';
+import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -23,6 +24,8 @@ interface StatusRecord {
   generation: number;
   accepted?: boolean;
   ledgerStatus?: string;
+  method?: string;
+  ordinal?: number;
 }
 
 function records(path: string): StatusRecord[] {
@@ -91,7 +94,16 @@ function frameworkConfig(
   };
 }
 
-test('startup keeps registration/control live while awareness gates inference and readiness', async () => {
+const DATA_METHODS = [
+  'push/event',
+  'inference/request',
+  'channels/incoming',
+  'host/command',
+] as const;
+
+for (const dataMethod of DATA_METHODS) test(
+  `startup gates ${dataMethod} while registration and control remain live`,
+  async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
   const dir = mkdtempSync(join(TEST_ROOT, 'awareness-startup-'));
   const statusPath = join(dir, 'status.jsonl');
@@ -100,6 +112,7 @@ test('startup keeps registration/control live while awareness gates inference an
     STATUS_PATH: statusPath,
     LEDGER_PATH: join(dir, 'awareness.json'),
     RELEASE_PATH: releasePath,
+    DATA_METHOD: dataMethod,
   });
   const outbox = preparePending(outboxPath);
   let framework: AgentFramework | undefined;
@@ -121,7 +134,7 @@ test('startup keeps registration/control live while awareness gates inference an
     assert.equal(
       records(statusPath).some((record) => record.event === 'push-response'),
       false,
-      'inference-bearing push must remain held while the marker is pending',
+      `${dataMethod} must remain held while the marker is pending`,
     );
     assert.equal(outbox.pending('discord').length, 1);
 
@@ -132,6 +145,7 @@ test('startup keeps registration/control live while awareness gates inference an
 
     const status = records(statusPath);
     const push = status.find((record) => record.event === 'push-response');
+    assert.equal(push?.method, dataMethod);
     assert.equal(push?.accepted, true);
     assert.equal(push?.ledgerStatus, 'applied', 'push released only after durable success');
     assert.equal(outbox.pending('discord').length, 0);
@@ -140,7 +154,8 @@ test('startup keeps registration/control live while awareness gates inference an
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
   }
-});
+  },
+);
 
 test('marker timeout is durably recorded and releases startup without a duplicate call', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
@@ -166,6 +181,86 @@ test('marker timeout is durably recorded and releases startup without a duplicat
     assert.equal(records(statusPath).filter((record) => record.event === 'reaction-call').length, 1);
     const push = records(statusPath).find((record) => record.event === 'push-response');
     assert.equal(push?.ledgerStatus, 'pending', 'failure was durable before inference release');
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('permanent marker failure is durably accounted before startup data is released', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-permanent-'));
+  const statusPath = join(dir, 'status.jsonl');
+  const { outboxPath, config } = frameworkConfig(dir, {
+    STATUS_PATH: statusPath,
+    LEDGER_PATH: join(dir, 'awareness.json'),
+    PERMANENT_REACTION: '1',
+  });
+  const outbox = preparePending(outboxPath);
+  let framework: AgentFramework | undefined;
+
+  try {
+    framework = await AgentFramework.create(config);
+    await waitFor('data response after permanent failure accounting', () =>
+      records(statusPath).some((record) => record.event === 'push-response'));
+
+    const entry = outbox.batches()[0]!.refs[0]!;
+    assert.equal(entry.deliveryStatus, 'permanent-failure');
+    assert.equal(entry.attempts, 1);
+    assert.match(entry.lastError ?? '', /Unknown Message/);
+    const response = records(statusPath).find((record) => record.event === 'push-response');
+    assert.equal(response?.ledgerStatus, 'permanent-failure');
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('initial reconnect stub durably records unavailable work, then retries behind a fresh gate', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-initial-unavailable-'));
+  const statusPath = join(dir, 'status.jsonl');
+  const releasePath = join(dir, 'release');
+  const generationPath = join(dir, 'generation');
+  const { outboxPath, config } = frameworkConfig(dir, {
+    STATUS_PATH: statusPath,
+    LEDGER_PATH: join(dir, 'awareness.json'),
+    RELEASE_PATH: releasePath,
+    GENERATION_PATH: generationPath,
+    FAIL_INITIAL_GENERATION: '1',
+  }, 1_000, {
+    reconnect: true,
+    reconnectIntervalMs: 100,
+    reconnectMaxIntervalMs: 100,
+  });
+  const outbox = preparePending(outboxPath);
+  let framework: AgentFramework | undefined;
+
+  try {
+    framework = await AgentFramework.create(config);
+    const deferred = outbox.batches()[0]!.refs[0]!;
+    assert.equal(deferred.deliveryStatus, 'pending');
+    assert.equal(deferred.attempts, 1, 'ready state must include a durable unavailable attempt');
+    assert.match(deferred.lastError ?? '', /not attempted.*connection unavailable/i);
+
+    await waitFor('successful reconnect registration and awareness call', () => {
+      const second = records(statusPath).filter((record) => record.generation === 2);
+      return second.some((record) => record.event === 'registration-response')
+        && second.some((record) => record.event === 'reaction-call');
+    });
+    assert.equal(
+      records(statusPath).some((record) =>
+        record.generation === 2 && record.event === 'push-response'),
+      false,
+      'reconnect data remains behind the newly installed awareness gate',
+    );
+
+    writeFileSync(releasePath, 'release');
+    await waitFor('reconnected data after durable marker success', () =>
+      records(statusPath).some((record) =>
+        record.generation === 2 && record.event === 'push-response'));
+    assert.equal(outbox.pending('discord').length, 0);
+    assert.equal(outbox.batches()[0]!.refs[0]!.attempts, 2);
   } finally {
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -286,4 +381,262 @@ test('reconnect pauses fresh inbound data but permits registration and awareness
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('startup fails explicitly when awareness reconciliation throws', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-reconcile-failure-'));
+  const statusPath = join(dir, 'status.jsonl');
+  const { outboxPath, config } = frameworkConfig(dir, {
+    STATUS_PATH: statusPath,
+    LEDGER_PATH: join(dir, 'awareness.json'),
+  });
+  preparePending(outboxPath);
+
+  const prototype = DiscordAwarenessOutbox.prototype as any;
+  const original = prototype.reconcileForBranch;
+  let calls = 0;
+  prototype.reconcileForBranch = function (...args: unknown[]) {
+    calls++;
+    if (calls === 2) throw new Error('injected reconcile failure');
+    return original.apply(this, args);
+  };
+  try {
+    await assert.rejects(
+      AgentFramework.create(config),
+      /awareness accounting failed.*injected reconcile failure/i,
+    );
+    assert.equal(
+      records(statusPath).some((record) => record.event === 'push-response'),
+      false,
+      'failed startup never reports a released data plane',
+    );
+  } finally {
+    prototype.reconcileForBranch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('startup fails explicitly when the awareness ledger read throws', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-read-failure-'));
+  const { outboxPath, config } = frameworkConfig(dir);
+  preparePending(outboxPath);
+
+  const prototype = DiscordAwarenessOutbox.prototype as any;
+  const original = prototype.pending;
+  prototype.pending = () => { throw new Error('injected read failure'); };
+  try {
+    await assert.rejects(
+      AgentFramework.create(config),
+      /awareness accounting failed.*injected read failure/i,
+    );
+  } finally {
+    prototype.pending = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const writeMethod of ['recordSuccess', 'recordFailure'] as const) test(
+  `startup fails explicitly when ${writeMethod} cannot persist`,
+  async () => {
+    mkdirSync(TEST_ROOT, { recursive: true });
+    const dir = mkdtempSync(join(TEST_ROOT, `awareness-${writeMethod}-failure-`));
+    const statusPath = join(dir, 'status.jsonl');
+    const { outboxPath, config } = frameworkConfig(dir, {
+      STATUS_PATH: statusPath,
+      LEDGER_PATH: join(dir, 'awareness.json'),
+      ...(writeMethod === 'recordFailure' ? { PERMANENT_REACTION: '1' } : {}),
+    });
+    preparePending(outboxPath);
+
+    const prototype = DiscordAwarenessOutbox.prototype as any;
+    const original = prototype[writeMethod];
+    prototype[writeMethod] = () => { throw new Error(`injected ${writeMethod} write failure`); };
+    try {
+      await assert.rejects(
+        AgentFramework.create(config),
+        new RegExp(`awareness accounting failed.*injected ${writeMethod} write failure`, 'i'),
+      );
+      assert.equal(
+        records(statusPath).some((record) => record.event === 'push-response'),
+        false,
+      );
+    } finally {
+      prototype[writeMethod] = original;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test('runtime reconciliation failure recycles the connection and keeps fresh data gated', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-accounting-'));
+  const statusPath = join(dir, 'status.jsonl');
+  const releasePath = join(dir, 'release');
+  const listChangePath = join(dir, 'list-change');
+  const generationPath = join(dir, 'generation');
+  const { outboxPath, config } = frameworkConfig(dir, {
+    STATUS_PATH: statusPath,
+    LEDGER_PATH: join(dir, 'awareness.json'),
+    RELEASE_PATH: releasePath,
+    LIST_CHANGE_PATH: listChangePath,
+    GENERATION_PATH: generationPath,
+  }, 1_000, {
+    reconnect: true,
+    reconnectIntervalMs: 20,
+    reconnectMaxIntervalMs: 20,
+  });
+  const outbox = new DiscordAwarenessOutbox(outboxPath);
+  let framework: AgentFramework | undefined;
+
+  try {
+    framework = await AgentFramework.create(config);
+    await waitFor('initial response', () =>
+      records(statusPath).some((record) => record.event === 'push-response'));
+    const batch = outbox.prepare({
+      agentName: 'assistant',
+      sourceBranch: 'source',
+      targetBranch: 'main',
+      activationPolicy: 'explicit',
+      refs: [{ serverId: 'discord', channelId: 'discord:guild:startup', messageId: 'runtime-fail' }],
+    })!;
+    outbox.activate(batch.id);
+
+    const prototype = DiscordAwarenessOutbox.prototype as any;
+    const original = prototype.reconcileForBranch;
+    let injected = false;
+    prototype.reconcileForBranch = function (...args: unknown[]) {
+      if (!injected) {
+        injected = true;
+        throw new Error('injected runtime reconcile failure');
+      }
+      return original.apply(this, args);
+    };
+    try {
+      writeFileSync(listChangePath, 'change');
+      await waitFor('replacement connection awareness call', () =>
+        records(statusPath).some((record) =>
+          record.generation === 2 && record.event === 'reaction-call'));
+    } finally {
+      prototype.reconcileForBranch = original;
+    }
+
+    assert.equal(
+      records(statusPath).some((record) =>
+        record.generation === 2 && record.event === 'push-response'),
+      false,
+    );
+    writeFileSync(releasePath, 'release');
+    await waitFor('replacement connection data release', () =>
+      records(statusPath).some((record) =>
+        record.generation === 2 && record.event === 'push-response'));
+    assert.equal(outbox.pending('discord').length, 0);
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+test('a control flush that installs a newer generation cannot be released by the old barrier', async () => {
+  const oldDrain = deferred<any>();
+  const newDrain = deferred<any>();
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessBarriers = new Map();
+  framework.discordAwarenessBarrierGenerations = new Map();
+  const drains = [oldDrain.promise, newDrain.promise];
+  framework.beginDiscordAwarenessBarrier = () => ({
+    requiresBarrier: true,
+    promise: drains.shift(),
+  });
+
+  let readyCalls = 0;
+  let newer: any;
+  const connection = {
+    id: 'discord',
+    pauseDataPlane: () => {},
+    ready: () => { readyCalls++; },
+    readyControlPlane: () => {
+      if (newer) return;
+      newer = framework.installMcplDataPlaneGate(connection);
+      framework.releaseMcplDataPlaneGate(connection, newer);
+    },
+  };
+
+  const older = framework.installMcplDataPlaneGate(connection);
+  framework.releaseMcplDataPlaneGate(connection, older);
+  assert.equal(newer.generation, older.generation + 1);
+
+  oldDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
+  await older.promise;
+  assert.equal(framework.completeMcplDataPlaneGate(connection, older), false);
+  assert.equal(readyCalls, 0, 'old completion leaves fresh data held');
+
+  newDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
+  await newer.promise;
+  assert.equal(framework.completeMcplDataPlaneGate(connection, newer), true);
+  assert.equal(readyCalls, 1);
+});
+
+test('overlapping reconnect/list-change generations release only the newest barrier', async () => {
+  const reconnectDrain = deferred<any>();
+  const listChangeDrain = deferred<any>();
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessBarriers = new Map();
+  framework.discordAwarenessBarrierGenerations = new Map();
+  const drains = [reconnectDrain.promise, listChangeDrain.promise];
+  framework.beginDiscordAwarenessBarrier = () => ({
+    requiresBarrier: true,
+    promise: drains.shift(),
+  });
+  let readyCalls = 0;
+  const connection = {
+    id: 'discord',
+    pauseDataPlane: () => {},
+    readyControlPlane: () => {},
+    ready: () => { readyCalls++; },
+  };
+
+  const reconnectBarrier = framework.installMcplDataPlaneGate(connection);
+  framework.releaseMcplDataPlaneGate(connection, reconnectBarrier);
+  const listChangeBarrier = framework.installMcplDataPlaneGate(connection);
+  framework.releaseMcplDataPlaneGate(connection, listChangeBarrier);
+
+  reconnectDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
+  await reconnectBarrier.promise;
+  framework.completeMcplDataPlaneGate(connection, reconnectBarrier);
+  assert.equal(readyCalls, 0, 'reconnect completion cannot bypass overlapping list-change work');
+
+  listChangeDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
+  await listChangeBarrier.promise;
+  framework.completeMcplDataPlaneGate(connection, listChangeBarrier);
+  assert.equal(readyCalls, 1);
+});
+
+test('synchronous zero-pending flush rechecks the gate after a nested list change', () => {
+  const connection = new (McplServerConnection as any)(
+    'discord', null, null,
+  ) as McplServerConnection;
+  let dataDeliveries = 0;
+  connection.on('tools-list-changed', () => connection.pauseDataPlane());
+  connection.on('push-event', () => { dataDeliveries++; });
+
+  connection.emit('tools-list-changed');
+  connection.emit('push-event', {});
+  connection.ready();
+  assert.equal(
+    dataDeliveries,
+    0,
+    'the nested list-change pause must retain later items from the same ready() snapshot',
+  );
+
+  connection.ready();
+  assert.equal(dataDeliveries, 1);
 });

@@ -7,6 +7,10 @@ const crashPath = process.env.CRASH_PATH;
 const generationPath = process.env.GENERATION_PATH;
 const listChangePath = process.env.LIST_CHANGE_PATH;
 const failReaction = process.env.FAIL_REACTION === '1';
+const permanentReaction = process.env.PERMANENT_REACTION === '1';
+const failInitialGeneration = process.env.FAIL_INITIAL_GENERATION === '1';
+const nestedListChangeGeneration = Number(process.env.NESTED_LIST_CHANGE_GENERATION ?? 0);
+const dataMethod = process.env.DATA_METHOD ?? 'push/event';
 
 let generation = 1;
 if (generationPath) {
@@ -32,11 +36,17 @@ const channel = (suffix) => ({
   direction: 'bidirectional',
 });
 
+if (failInitialGeneration && generation === 1) {
+  log('initial-connect-failure');
+  process.exit(9);
+}
+
 let initialized = false;
 let registered = false;
 let pendingToolRequest = null;
 let pendingControl = false;
 let listChangeTriggered = false;
+let reactionOrdinal = 0;
 let buf = '';
 
 function ledgerDeliveryStatus() {
@@ -51,11 +61,18 @@ function ledgerDeliveryStatus() {
 
 function maybeReplyToReaction() {
   if (!pendingToolRequest || pendingControl || failReaction) return;
-  if (releasePath && !existsSync(releasePath)) return;
+  if (releasePath) {
+    if (!existsSync(releasePath)) return;
+    const releaseValue = readFileSync(releasePath, 'utf8').trim();
+    const releaseOrdinal = Number(releaseValue);
+    if (Number.isFinite(releaseOrdinal) && releaseOrdinal < pendingToolRequest.ordinal) return;
+  }
   const requestId = pendingToolRequest.id;
   pendingToolRequest = null;
   log('reaction-response');
-  reply(requestId, { content: [{ type: 'text', text: 'Reaction applied' }] });
+  reply(requestId, permanentReaction
+    ? { isError: true, content: [{ type: 'text', text: 'Unknown Message' }] }
+    : { content: [{ type: 'text', text: 'Reaction applied' }] });
 }
 
 function serviceReaction(message) {
@@ -64,10 +81,51 @@ function serviceReaction(message) {
     log('reaction-queued-before-registration');
     return;
   }
-  pendingToolRequest = message;
+  reactionOrdinal++;
+  pendingToolRequest = { ...message, ordinal: reactionOrdinal };
   pendingControl = true;
-  log('reaction-call', { name: message.params?.name });
+  log('reaction-call', { name: message.params?.name, ordinal: reactionOrdinal });
   request(201, 'channels/register', { channels: [channel('control-during-barrier')] });
+  if (
+    nestedListChangeGeneration === generation
+    && reactionOrdinal === 1
+    && !listChangeTriggered
+  ) {
+    listChangeTriggered = true;
+    log('tools-list-changed-notification');
+    send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed', params: {} });
+    sendDataRequest(302, 'list-change');
+  }
+}
+
+function sendDataRequest(id, phase) {
+  let params;
+  if (dataMethod === 'inference/request') {
+    params = {
+      featureSet: 'chat',
+      messages: [{ role: 'user', content: `must wait for ${phase} awareness` }],
+    };
+  } else if (dataMethod === 'channels/incoming') {
+    params = {
+      messages: [{
+        channelId: 'discord:guild:startup',
+        messageId: `${phase}-incoming-${generation}`,
+        author: { id: 'human', name: 'Human' },
+        timestamp: new Date().toISOString(),
+        content: [{ type: 'text', text: `must wait for ${phase} awareness` }],
+      }],
+    };
+  } else if (dataMethod === 'host/command') {
+    params = { command: 'barrier-probe', agentName: 'assistant' };
+  } else {
+    params = {
+      featureSet: 'chat',
+      eventId: `${phase}-push-${generation}`,
+      timestamp: new Date().toISOString(),
+      payload: { content: [{ type: 'text', text: `must wait for ${phase} awareness` }] },
+    };
+  }
+  request(id, dataMethod, params);
 }
 
 function beginServerTraffic() {
@@ -77,12 +135,7 @@ function beginServerTraffic() {
   request(200, 'channels/register', { channels: [channel('startup')] });
   // The reconnect generation carries an inference-bearing event in the same
   // registration window. Initial-start tests use generation 1 as well.
-  request(202, 'push/event', {
-    featureSet: 'chat',
-    eventId: `barrier-push-${generation}`,
-    timestamp: new Date().toISOString(),
-    payload: { content: [{ type: 'text', text: 'must wait for awareness' }] },
-  });
+  sendDataRequest(202, 'startup');
 }
 
 function handle(message) {
@@ -135,8 +188,13 @@ function handle(message) {
     return;
   }
   if (message.id === 202 || message.id === 302) {
-    log(message.id === 202 ? 'push-response' : 'list-change-push-response', {
-      accepted: message.result?.accepted,
+    const event = message.id === 202 ? 'push-response' : 'list-change-push-response';
+    const accepted = message.result?.accepted
+      ?? message.result?.results?.[0]?.accepted
+      ?? (message.error == null);
+    log(event, {
+      method: dataMethod,
+      accepted,
       ledgerStatus: ledgerDeliveryStatus(),
     });
   }
@@ -163,12 +221,7 @@ const timer = setInterval(() => {
     listChangeTriggered = true;
     log('tools-list-changed-notification');
     send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed', params: {} });
-    request(302, 'push/event', {
-      featureSet: 'chat',
-      eventId: `list-change-push-${generation}`,
-      timestamp: new Date().toISOString(),
-      payload: { content: [{ type: 'text', text: 'must wait for list-change awareness' }] },
-    });
+    sendDataRequest(302, 'list-change');
   }
   if (crashPath && existsSync(crashPath) && generation === 1) {
     log('crashing');
