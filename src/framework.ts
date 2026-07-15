@@ -462,7 +462,7 @@ export class AgentFramework {
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<void>> = new Map();
-  /** Reconnect traffic waits for the marker reconciliation started by that reconnect. */
+  /** Inference traffic waits for marker reconciliation; MCPL control traffic stays live. */
   private discordAwarenessBarriers: Map<string, Promise<void>> = new Map();
 
   // EventGate (null when FrameworkConfig.gate is omitted)
@@ -5668,6 +5668,28 @@ export class AgentFramework {
   }
 
   /**
+   * Install a Discord-awareness gate before releasing any inference-bearing
+   * event. With pending work, only the MCPL control plane is released until the
+   * durable drain settles. With no pending work, ready() runs synchronously so
+   * request responders preserve their historical same-stack behavior.
+   */
+  private installMcplDataPlaneGate(connection: McplServerConnection): Promise<void> {
+    connection.pauseDataPlane();
+    return this.beginDiscordAwarenessBarrier(connection.id);
+  }
+
+  private releaseMcplDataPlaneGate(
+    connection: McplServerConnection,
+    barrier: Promise<void>,
+  ): void {
+    if (this.getDiscordAwarenessBarrier(connection.id) !== barrier) {
+      connection.ready();
+      return;
+    }
+    connection.readyControlPlane();
+  }
+
+  /**
    * Connect a single MCPL server: register routing entries, open the
    * connection, wire events, and initialize feature sets / scopes /
    * checkpoints. Shared by startup (initializeMcpl) and the runtime
@@ -5697,14 +5719,17 @@ export class AgentFramework {
 
     const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
 
-    // Wire listeners, but do not release events buffered during the handshake
-    // until branch-awareness markers have been reconciled and attempted.
+    // Wire listeners, install the inference gate synchronously, then release
+    // control traffic so registration can complete and the same server can
+    // service awareness tools/call requests.
     this.wireMcplEvents(connection);
 
     // Initialize feature sets if server advertises MCPL capabilities
     this.registerMcplServerFeatures(config, connection);
 
-    await this.beginDiscordAwarenessBarrier(config.id);
+    const awarenessBarrier = this.installMcplDataPlaneGate(connection);
+    this.releaseMcplDataPlaneGate(connection, awarenessBarrier);
+    await awarenessBarrier;
     connection.ready();
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
@@ -5987,8 +6012,15 @@ export class AgentFramework {
 
     // Handle dynamic tool list changes (notifications/tools/list_changed)
     connection.on('tools-list-changed', () => {
+      // Pause before starting any async refresh. This listener runs
+      // synchronously in the transport line callback, so a following inbound
+      // data event cannot pass before the new barrier exists.
+      const awarenessBarrier = this.installMcplDataPlaneGate(connection);
+      this.releaseMcplDataPlaneGate(connection, awarenessBarrier);
       this.handleToolsListChanged(connection.id);
-      void this.beginDiscordAwarenessBarrier(connection.id).catch((error) => {
+      void awarenessBarrier.then(() => {
+        connection.ready();
+      }).catch((error) => {
         console.error(
           `[discord-awareness] tools-list reconciliation failed for ${connection.id}:`,
           error instanceof Error ? error.message : error,
@@ -6005,8 +6037,9 @@ export class AgentFramework {
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
       // Install the barrier synchronously so any inbound event emitted after
-      // reconnect observes it before doing work that could wake an agent.
-      const awarenessBarrier = this.beginDiscordAwarenessBarrier(connection.id);
+      // reconnect observes it before doing work that could wake an agent. The
+      // connection paused its data plane before wiring the fresh transport.
+      const awarenessBarrier = this.installMcplDataPlaneGate(connection);
       try {
         const config = this.mcplServerConfigs.get(connection.id);
         if (config) {
@@ -6018,8 +6051,10 @@ export class AgentFramework {
           error instanceof Error ? error.message : error,
         );
       }
+      this.releaseMcplDataPlaneGate(connection, awarenessBarrier);
       this.handleToolsListChanged(connection.id);
       void awarenessBarrier.then(() => {
+        connection.ready();
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,

@@ -51,12 +51,20 @@ class FakeConnection extends EventEmitter {
   capabilities: McplCapabilities | null = CAPABILITIES;
   willReconnect = true;
   featureSetUpdates: unknown[] = [];
+  onReady: (() => void) | undefined;
   constructor(id: string) {
     super();
     this.id = id;
   }
   sendFeatureSetsUpdate(params: unknown): void {
     this.featureSetUpdates.push(params);
+  }
+  pauseDataPlane(): void {}
+  readyControlPlane(): void {}
+  ready(): void {
+    const callback = this.onReady;
+    this.onReady = undefined;
+    callback?.();
   }
 }
 
@@ -138,12 +146,18 @@ test('reconnect re-registers the server: pushes are accepted again after closeâ†
   assert.match(down.reason ?? '', /Unknown server/);
 
   // Reconnect succeeded (fresh handshake refreshed capabilities).
+  // Zero pending awareness work takes the synchronous full-ready path. Model a
+  // push already buffered on the fresh transport: ready() flushes it in the
+  // reconnect listener's stack, after host-side feature re-registration.
+  let duringReconnect: PushEventResult | undefined;
+  connection.onReady = () => { duringReconnect = sendPush('e3'); };
   connection.emit('reconnect', { attempts: 1 });
+  assert.equal(duringReconnect?.accepted, true);
 
   // THE regression: before the fix this stayed rejected forever.
-  const revived = sendPush('e3');
+  const revived = sendPush('e4');
   assert.equal(revived.accepted, true, `push after reconnect must be accepted, got: ${revived.reason}`);
-  assert.equal(pushed.length, 2);
+  assert.equal(pushed.length, 3);
 
   // The server was told its enabled feature sets again on re-registration.
   assert.equal(connection.featureSetUpdates.length, 2, 'featureSets/update re-sent on reconnect');

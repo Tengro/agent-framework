@@ -112,8 +112,12 @@ export class McplServerConnection extends EventEmitter {
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
 
-  // Event buffering: events emitted before ready() are queued, not lost
-  private readyFlag = false;
+  // Event buffering: control-plane traffic can be released independently from
+  // inference-bearing data-plane traffic. This lets a server finish its own
+  // registration (and answer host tools/call requests) while startup/reconnect
+  // reconciliation keeps agent wakes behind a durable barrier.
+  private controlPlaneReady = false;
+  private dataPlaneReady = false;
   private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
@@ -162,24 +166,82 @@ export class McplServerConnection extends EventEmitter {
    * the caller has attached listeners via wireMcplEvents).
    */
   ready(): void {
-    this.readyFlag = true;
-    for (const { event, args } of this.bufferedEvents) {
+    this.controlPlaneReady = true;
+    this.dataPlaneReady = true;
+    const pending = this.bufferedEvents;
+    this.bufferedEvents = [];
+    for (const { event, args } of pending) {
       super.emit(event, ...args);
     }
-    this.bufferedEvents = [];
   }
 
   /**
-   * Override emit to buffer server→host events until ready() is called.
-   * Lifecycle events ('close', 'error', 'reconnect') always pass through.
+   * Release only server-establishment and lifecycle/control traffic. Responses
+   * to host requests are never event-buffered, so tools/list and tools/call
+   * responses remain live as well. Inference-bearing requests stay queued in
+   * their original relative order until {@link ready} is called.
+   */
+  readyControlPlane(): void {
+    this.controlPlaneReady = true;
+    const pending = this.bufferedEvents;
+    const deferred: Array<{ event: string; args: unknown[] }> = [];
+    this.bufferedEvents = [];
+    for (const item of pending) {
+      if (McplServerConnection.isControlPlaneEvent(item.event)) {
+        super.emit(item.event, ...item.args);
+      } else {
+        deferred.push(item);
+      }
+    }
+    // Data events emitted by control handlers while the snapshot was flushing
+    // were appended to the new buffer. Preserve their order behind older data.
+    this.bufferedEvents = [...deferred, ...this.bufferedEvents];
+  }
+
+  /**
+   * Close the data plane synchronously while leaving an already-released
+   * control plane live. Used before reconnect adoption and list-change
+   * reconciliation so no new inference event can beat barrier installation.
+   */
+  pauseDataPlane(): void {
+    this.dataPlaneReady = false;
+  }
+
+  /**
+   * Override emit to buffer server→host events until the corresponding plane
+   * is ready. Lifecycle events always pass through so reconnect can install a
+   * new data-plane gate before the fresh transport is exposed.
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
-    if (this.readyFlag || name === 'close' || name === 'error' || name === 'reconnect') {
+    if (
+      McplServerConnection.isLifecycleEvent(name)
+      || (McplServerConnection.isControlPlaneEvent(name)
+        ? this.controlPlaneReady
+        : this.dataPlaneReady)
+    ) {
       return super.emit(event, ...args);
     }
     this.bufferedEvents.push({ event: name, args });
     return true;
+  }
+
+  private static isControlPlaneEvent(event: string): boolean {
+    return event === 'stderr'
+      || event === 'scope-elevate'
+      || event === 'channels-register'
+      || event === 'channels-changed'
+      || event === 'feature-sets-changed'
+      || event === 'tools-list-changed'
+      || event === 'connect-failed'
+      || event === 'reconnect-failed'
+      || event === 'orphaned-response';
+  }
+
+  private static isLifecycleEvent(event: string): boolean {
+    return event === 'close'
+      || event === 'error'
+      || event === 'reconnect';
   }
 
   // ==========================================================================
@@ -551,16 +613,17 @@ export class McplServerConnection extends EventEmitter {
         this.hostCapabilities,
       );
 
-      // Adopt the new transport. Listeners were attached to external consumers
-      // on the first wire, so mark ready immediately (re-wire re-binds the
-      // transport-level handlers below).
+      // Close the data plane before the new transport can emit. The reconnect
+      // lifecycle event bypasses buffering; its framework listener installs the
+      // awareness barrier synchronously, then releases control traffic needed
+      // to establish the server while data remains held.
+      this.pauseDataPlane();
       this.transport = transport;
       this.capabilities = capabilities;
       this.closed = false;
       this.nextRequestId = 1;
       this.pendingRequests.clear();
       this.wireTransport(transport);
-      this.readyFlag = true;
 
       console.error(`MCPL server "${this.id}" reconnected successfully`);
       this.reconnectAttempts = 0;
