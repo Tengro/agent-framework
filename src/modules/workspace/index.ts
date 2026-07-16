@@ -491,6 +491,56 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * Write binary content (e.g. an image pulled from the agent's context) to a
+   * mount, through the same Chronicle-tree + auto-materialize path as the
+   * `write` tool. Public API for the framework's synthesized `save_image`
+   * tool and other peer callers that hold bytes rather than text.
+   */
+  async writeBinary(
+    mountPrefixedPath: string,
+    data: Buffer,
+    mimeType: string,
+  ): Promise<ToolResult> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        isError: true,
+      };
+    }
+    if (mount.config.mode === 'read-only') {
+      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
+    }
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    if (data.byteLength > maxSize) {
+      return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
+    }
+    const store = this.getStore();
+    const blobHash = store.storeBlob(data, mimeType);
+    store.treeSet(mount.treeStateId, relativePath, {
+      blobHash,
+      size: data.byteLength,
+      mode: 0o644,
+    });
+    const materializeError = await this.autoMaterialize(mount, relativePath, 'write', data);
+    if (materializeError) {
+      return {
+        success: false,
+        error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
+        isError: true,
+      };
+    }
+    return {
+      success: true,
+      data: { path: mountPrefixedPath, size: data.byteLength, mimeType },
+    };
+  }
+
+  /**
    * Parse a mount-prefixed path into (mountName, relativePath).
    */
   private parsePath(path: string): { mount: MountState; relativePath: string } {

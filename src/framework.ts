@@ -61,6 +61,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import type { WorkspaceModule } from './modules/workspace/index.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
 import { splitProseSegments } from './prose-segments.js';
 
@@ -1095,7 +1096,16 @@ export class AgentFramework {
       ...channelTools,
       ...gateTools,
       this.buildAgentSettingsTool(),
+      ...(this.getWorkspaceModule() ? [AgentFramework.SAVE_IMAGE_TOOL] : []),
     ];
+  }
+
+  /** The registered workspace module, if any (used by save_image). */
+  private getWorkspaceModule(): WorkspaceModule | undefined {
+    const module = this.moduleRegistry.getAllModules().find((m) => m.name === 'workspace');
+    return module && typeof (module as WorkspaceModule).writeBinary === 'function'
+      ? (module as WorkspaceModule)
+      : undefined;
   }
 
   /** Core agent_settings keys — extension keys must not collide with these. */
@@ -1768,6 +1778,39 @@ export class AgentFramework {
       'gate (gate.js). Use these tag names in gate.json policies (tagsAny / ' +
       'tagsAll / tagsNone) or in gate.js.',
     inputSchema: { type: 'object' },
+  };
+
+  /** Synthesized save_image tool — present when a workspace module is
+   *  registered. Lets the agent persist an image it has already seen in its
+   *  own context (Discord attachments arrive inlined as base64 and are
+   *  otherwise unreachable as files). */
+  private static readonly SAVE_IMAGE_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'save_recent_image',
+    description:
+      'Save one or more recent images from your own context to workspace files. ' +
+      'Images are counted back from the most recent (index 0). A single image is ' +
+      'written to `path` as given (e.g. "project/photos/cat.png"); when `count` > 1 ' +
+      'the range index..index+count-1 is saved with numeric suffixes ' +
+      '("cat-0.png", "cat-1.png", …; 0 = the newest of the range). Saved files are ' +
+      'visible via workspace tools and the /files/ endpoint.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Mount-prefixed destination path, e.g. "project/photos/name.png".',
+        },
+        index: {
+          type: 'number',
+          description: 'Which image, counting back from the most recent (0 = most recent). Default 0.',
+        },
+        count: {
+          type: 'number',
+          description: 'How many images to save, starting at `index` and going further back. Default 1.',
+        },
+      },
+      required: ['path'],
+    },
   };
 
   private static readonly AGENT_SETTINGS_TOOL: import('./types/index.js').ToolDefinition = {
@@ -4876,6 +4919,11 @@ export class AgentFramework {
       return;
     }
 
+    if (enrichedCall.name === 'save_recent_image') {
+      this.dispatchSaveImageToolCall(agentName, enrichedCall);
+      return;
+    }
+
     // Route gate_status tool
     if (enrichedCall.name === 'gate_status' && this.eventGate) {
       this.dispatchGateToolCall(agentName, enrichedCall);
@@ -6629,6 +6677,153 @@ export class AgentFramework {
       },
       endTurn: true,
     });
+  }
+
+  /**
+   * Handle the synthesized `save_recent_image` tool: locate the requested
+   * image blocks in the calling agent's context (blobs re-inlined, counted
+   * back from the most recent) and write their bytes to a workspace mount
+   * via WorkspaceModule.writeBinary.
+   */
+  private dispatchSaveImageToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
+    const finish = (result: ToolResult): void => {
+      this.emitTrace({
+        type: result.isError ? 'tool:failed' : 'tool:completed',
+        module: 'workspace',
+        tool: call.name,
+        callId: call.id,
+        durationMs: 0,
+        ...(result.isError ? { error: result.error } : {}),
+      });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+    };
+    void (async (): Promise<void> => {
+      try {
+        const workspace = this.getWorkspaceModule();
+        if (!workspace) throw new Error('save_recent_image requires a workspace module');
+        const agent = this.agents.get(agentName);
+        if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+        const input = (call.input ?? {}) as { path?: unknown; index?: unknown; count?: unknown };
+        if (typeof input.path !== 'string' || input.path.length === 0) {
+          throw new Error('save_recent_image: `path` (mount-prefixed) is required');
+        }
+        const index = input.index === undefined ? 0 : Number(input.index);
+        if (!Number.isInteger(index) || index < 0) {
+          throw new Error('save_recent_image: `index` must be a non-negative integer');
+        }
+        const count = input.count === undefined ? 1 : Number(input.count);
+        const MAX_COUNT = 20;
+        if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
+          throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}`);
+        }
+        const lastWanted = index + count - 1;
+
+        // Walk the message store tail-first in bounded windows, re-inlining
+        // blob media, until we've collected the requested range. Scanning is
+        // capped so a pathological index can't drag the whole store through
+        // blob resolution.
+        const MAX_SCAN = 500;
+        const WINDOW = 25;
+        const cm = agent.getContextManager();
+        const total = cm.getMessageCount();
+        let seen = 0;
+        let scanned = 0;
+        const found: Array<{
+          rangeOffset: number;
+          data: string;
+          mediaType: string;
+          messagesBack: number;
+        }> = [];
+        for (let end = total; end > 0 && scanned < MAX_SCAN && found.length < count; end -= WINDOW) {
+          const start = Math.max(0, end - WINDOW);
+          const { messages } = cm.getMessageWindow(start, end - start, { resolveBlobs: true });
+          scanned += end - start;
+          for (let i = messages.length - 1; i >= 0 && found.length < count; i--) {
+            const content = messages[i]?.content;
+            if (!Array.isArray(content)) continue;
+            for (let b = content.length - 1; b >= 0 && found.length < count; b--) {
+              const block = content[b] as {
+                type?: string;
+                source?: { type?: string; data?: string; mediaType?: string };
+              };
+              if (block?.type !== 'image') continue;
+              if (seen >= index && seen <= lastWanted) {
+                if (block.source?.type !== 'base64' || typeof block.source.data !== 'string') {
+                  throw new Error(
+                    `save_recent_image: image at index ${seen} is not stored inline (base64) — cannot save it`,
+                  );
+                }
+                found.push({
+                  rangeOffset: seen - index,
+                  data: block.source.data,
+                  mediaType: block.source.mediaType ?? 'image/png',
+                  messagesBack: total - (start + i),
+                });
+              }
+              seen++;
+            }
+          }
+        }
+        if (found.length === 0) {
+          throw new Error(
+            seen === 0
+              ? `save_recent_image: no images found in the most recent ${Math.min(scanned, MAX_SCAN)} messages`
+              : `save_recent_image: only ${seen} image(s) found in the most recent ${Math.min(scanned, MAX_SCAN)} messages (asked for index ${index})`,
+          );
+        }
+
+        // Single image → path as given. Range → numeric suffix before the
+        // extension ("cat.png" → "cat-0.png"), 0 = newest of the range.
+        const pathFor = (rangeOffset: number): string => {
+          if (count === 1) return input.path as string;
+          const p = input.path as string;
+          const dot = p.lastIndexOf('.');
+          const slash = p.lastIndexOf('/');
+          return dot > slash
+            ? `${p.slice(0, dot)}-${rangeOffset}${p.slice(dot)}`
+            : `${p}-${rangeOffset}`;
+        };
+        const savedFiles: Array<Record<string, unknown>> = [];
+        for (const image of found) {
+          const destination = pathFor(image.rangeOffset);
+          const bytes = Buffer.from(image.data, 'base64');
+          const result = await workspace.writeBinary(destination, bytes, image.mediaType);
+          if (!result.success) {
+            finish({
+              success: false,
+              error:
+                `save_recent_image: failed writing "${destination}": ${result.error}` +
+                (savedFiles.length > 0
+                  ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
+                  : ''),
+              isError: true,
+            });
+            return;
+          }
+          savedFiles.push({
+            ...(result.data as Record<string, unknown>),
+            imageIndex: index + image.rangeOffset,
+            messagesBack: image.messagesBack,
+          });
+        }
+        finish({
+          success: true,
+          data: {
+            saved: savedFiles,
+            ...(found.length < count
+              ? { note: `only ${found.length} of ${count} requested images exist in the scanned window` }
+              : {}),
+          },
+        });
+      } catch (error) {
+        finish({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          isError: true,
+        });
+      }
+    })();
   }
 
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
