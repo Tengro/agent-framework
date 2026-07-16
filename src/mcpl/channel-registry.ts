@@ -1404,12 +1404,13 @@ export class ChannelRegistry {
   private handleToolThink(input: { content?: string }): ToolResult {
     return {
       success: true,
+      // Same echo-avoidance as skip_reply: the thought text is already in the
+      // tool_use block; don't duplicate it in the result.
       data: {
         noted: true,
         note:
           'Thought recorded (private — not sent anywhere). This did NOT silence your turn: ' +
           'write plain text to reply, or call skip_reply to end the turn without replying.',
-        content: typeof input?.content === 'string' ? input.content : undefined,
       },
     };
   }
@@ -1430,10 +1431,12 @@ export class ChannelRegistry {
       // again: observed as a 40+ round skip_reply loop on Fable 5, burning a
       // round-trip + ~70 tokens per iteration until something kills the turn.
       endTurn: true,
+      // Deliberately terse: the agent's `reason` is already in the tool_use
+      // block — echoing it back doubled every skip turn's footprint (observed
+      // on Fable: ~60% of skip_reply result bytes were verbatim input echo).
       data: {
         skipped: true,
-        note: 'Ended the turn without replying — nothing was sent to any channel.',
-        reason: typeof input?.reason === 'string' ? input.reason : undefined,
+        note: 'Turn ended; nothing sent.',
       },
     };
   }
