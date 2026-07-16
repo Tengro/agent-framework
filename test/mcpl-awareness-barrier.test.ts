@@ -22,6 +22,7 @@ const TEST_ROOT = join(process.cwd(), '.test-tmp');
 interface StatusRecord {
   event: string;
   generation: number;
+  serverId?: string;
   accepted?: boolean;
   ledgerStatus?: string;
   method?: string;
@@ -71,6 +72,7 @@ function frameworkConfig(
   extraEnv: Record<string, string> = {},
   requestTimeoutMs = 1_000,
   serverOverrides: Partial<McplServerConfig> = {},
+  awarenessDeadlineMs = 1_000,
 ) {
   const outboxPath = join(dir, 'awareness.json');
   return {
@@ -78,6 +80,7 @@ function frameworkConfig(
     config: {
       storePath: join(dir, 'store'),
       discordAwarenessOutboxPath: outboxPath,
+      discordAwarenessDeadlineMs: awarenessDeadlineMs,
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
       modules: [],
@@ -94,6 +97,54 @@ function frameworkConfig(
   };
 }
 
+function twoServerFrameworkConfig(
+  dir: string,
+  order: 'heartbeat-first' | 'discord-first',
+  dataMethod: typeof DATA_METHODS[number],
+  runtime = false,
+) {
+  const outboxPath = join(dir, 'awareness.json');
+  const statusPath = join(dir, 'status.jsonl');
+  const releasePath = join(dir, 'release');
+  const listChangePath = join(dir, 'list-change');
+  const arrivalPath = join(dir, 'heartbeat-arrival');
+  const server = (id: 'heartbeat' | 'discord'): McplServerConfig => ({
+    id,
+    command: process.execPath,
+    args: [FIXTURE],
+    requestTimeoutMs: 0,
+    env: {
+      STATUS_PATH: statusPath,
+      LEDGER_PATH: outboxPath,
+      SERVER_ID: id,
+      DATA_METHOD: dataMethod,
+      ...(id === 'discord'
+        ? { RELEASE_PATH: releasePath, WAIT_FOR_ARRIVAL_PATH: arrivalPath }
+        : { ARRIVAL_PATH: arrivalPath }),
+      ...(runtime && id === 'heartbeat' ? { LIST_CHANGE_PATH: listChangePath } : {}),
+    },
+    enabledFeatureSets: ['chat'],
+  });
+  const servers = order === 'heartbeat-first'
+    ? [server('heartbeat'), server('discord')]
+    : [server('discord'), server('heartbeat')];
+  return {
+    outboxPath,
+    statusPath,
+    releasePath,
+    listChangePath,
+    config: {
+      storePath: join(dir, 'store'),
+      discordAwarenessOutboxPath: outboxPath,
+      discordAwarenessDeadlineMs: 1_000,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
+      modules: [],
+      mcplServers: servers,
+    },
+  };
+}
+
 const DATA_METHODS = [
   'push/event',
   'inference/request',
@@ -101,63 +152,91 @@ const DATA_METHODS = [
   'host/command',
 ] as const;
 
-for (const dataMethod of DATA_METHODS) test(
-  `startup gates ${dataMethod} while registration and control remain live`,
-  async () => {
-  mkdirSync(TEST_ROOT, { recursive: true });
-  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-startup-'));
-  const statusPath = join(dir, 'status.jsonl');
-  const releasePath = join(dir, 'release');
-  const { outboxPath, config } = frameworkConfig(dir, {
-    STATUS_PATH: statusPath,
-    LEDGER_PATH: join(dir, 'awareness.json'),
-    RELEASE_PATH: releasePath,
-    DATA_METHOD: dataMethod,
-  });
-  const outbox = preparePending(outboxPath);
-  let framework: AgentFramework | undefined;
-  let createSettled = false;
-  const creating = AgentFramework.create(config).then((created) => {
-    framework = created;
-    createSettled = true;
-    return created;
-  });
+for (const order of ['heartbeat-first', 'discord-first'] as const) {
+  for (const dataMethod of DATA_METHODS) test(
+    `startup globally gates ${dataMethod} with ${order} config`,
+    async () => {
+      mkdirSync(TEST_ROOT, { recursive: true });
+      const dir = mkdtempSync(join(TEST_ROOT, 'awareness-startup-'));
+      const { outboxPath, statusPath, releasePath, config } = twoServerFrameworkConfig(
+        dir,
+        order,
+        dataMethod,
+      );
+      const outbox = preparePending(outboxPath);
+      let framework: AgentFramework | undefined;
+      let createSettled = false;
+      const creating = AgentFramework.create(config).then((created) => {
+        framework = created;
+        createSettled = true;
+        return created;
+      });
 
-  try {
-    await waitFor('registration and a second control response', () => {
-      const events = records(statusPath).map((record) => record.event);
-      return events.includes('registration-response')
-        && events.includes('control-response-during-barrier');
-    });
+      try {
+        await waitFor('registration and a second control response', () => {
+          const events = records(statusPath)
+            .filter((record) => record.serverId === 'discord')
+            .map((record) => record.event);
+          return events.includes('registration-response')
+            && events.includes('control-response-during-barrier');
+        });
 
-    assert.equal(createSettled, false, 'framework readiness must wait for the marker outcome');
-    assert.equal(
-      records(statusPath).some((record) => record.event === 'push-response'),
-      false,
-      `${dataMethod} must remain held while the marker is pending`,
-    );
-    assert.equal(outbox.pending('discord').length, 1);
+        const discordOrdering = records(statusPath)
+          .filter((record) => record.serverId === 'discord')
+          .map((record) => record.event)
+          .filter((event) => [
+            'reaction-queued-before-registration',
+            'registration-response',
+            'reaction-call',
+          ].includes(event));
+        assert.deepEqual(discordOrdering, [
+          'reaction-queued-before-registration',
+          'registration-response',
+          'reaction-call',
+        ]);
+        const allStatus = records(statusPath);
+        const heartbeatArrival = allStatus.findIndex((record) =>
+          record.serverId === 'heartbeat' && record.event === 'data-request-sent');
+        const discordDrain = allStatus.findIndex((record) =>
+          record.serverId === 'discord' && record.event === 'reaction-queued-before-registration');
+        assert.ok(
+          heartbeatArrival >= 0 && heartbeatArrival < discordDrain,
+          'non-Discord data arrives before Discord registration/drain starts',
+        );
 
-    writeFileSync(releasePath, 'release');
-    await creating;
-    await waitFor('gated push response', () =>
-      records(statusPath).some((record) => record.event === 'push-response'));
+        assert.equal(createSettled, false, 'framework readiness must wait for the marker outcome');
+        assert.equal(
+          records(statusPath).some((record) =>
+            record.serverId === 'heartbeat' && record.event === 'push-response'),
+          false,
+          `non-Discord ${dataMethod} must remain held while the Discord marker is pending`,
+        );
+        assert.equal(outbox.pending('discord').length, 1);
 
-    const status = records(statusPath);
-    const push = status.find((record) => record.event === 'push-response');
-    assert.equal(push?.method, dataMethod);
-    assert.equal(push?.accepted, true);
-    assert.equal(push?.ledgerStatus, 'applied', 'push released only after durable success');
-    assert.equal(outbox.pending('discord').length, 0);
-    assert.equal(status.filter((record) => record.event === 'reaction-call').length, 1);
-  } finally {
-    await framework?.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
-  },
-);
+        writeFileSync(releasePath, 'release');
+        await creating;
+        await waitFor('gated push response', () =>
+          records(statusPath).some((record) =>
+            record.serverId === 'heartbeat' && record.event === 'push-response'));
 
-test('marker timeout is durably recorded and releases startup without a duplicate call', async () => {
+        const status = records(statusPath);
+        const push = status.find((record) =>
+          record.serverId === 'heartbeat' && record.event === 'push-response');
+        assert.equal(push?.method, dataMethod);
+        assert.equal(push?.accepted, true);
+        assert.equal(push?.ledgerStatus, 'applied', 'push released only after durable success');
+        assert.equal(outbox.pending('discord').length, 0);
+        assert.equal(status.filter((record) =>
+          record.serverId === 'discord' && record.event === 'reaction-call').length, 1);
+      } finally {
+        await framework?.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+test('mandatory awareness deadline survives requestTimeoutMs: 0 and durably releases startup', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
   const dir = mkdtempSync(join(TEST_ROOT, 'awareness-timeout-'));
   const statusPath = join(dir, 'status.jsonl');
@@ -165,7 +244,7 @@ test('marker timeout is durably recorded and releases startup without a duplicat
     STATUS_PATH: statusPath,
     LEDGER_PATH: join(dir, 'awareness.json'),
     FAIL_REACTION: '1',
-  }, 60);
+  }, 0, {}, 60);
   const outbox = preparePending(outboxPath);
   let framework: AgentFramework | undefined;
 
@@ -178,6 +257,7 @@ test('marker timeout is durably recorded and releases startup without a duplicat
     assert.equal(entry.deliveryStatus, 'pending');
     assert.equal(entry.attempts, 1);
     assert.match(entry.lastError ?? '', /did not respond to tools\/call/);
+    assert.match(entry.lastError ?? '', /outcome is unknown/i);
     assert.equal(records(statusPath).filter((record) => record.event === 'reaction-call').length, 1);
     const push = records(statusPath).find((record) => record.event === 'push-response');
     assert.equal(push?.ledgerStatus, 'pending', 'failure was durable before inference release');
@@ -319,6 +399,70 @@ test('tools/list_changed installs the data gate before a following push', async 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const dataMethod of DATA_METHODS) test(
+  `runtime awareness generation globally gates non-Discord ${dataMethod}`,
+  async () => {
+    mkdirSync(TEST_ROOT, { recursive: true });
+    const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-global-'));
+    const {
+      outboxPath,
+      statusPath,
+      releasePath,
+      listChangePath,
+      config,
+    } = twoServerFrameworkConfig(dir, 'discord-first', dataMethod, true);
+    const outbox = new DiscordAwarenessOutbox(outboxPath);
+    let framework: AgentFramework | undefined;
+
+    try {
+      framework = await AgentFramework.create(config);
+      await waitFor('both initial data responses', () => {
+        const initial = records(statusPath).filter((record) => record.event === 'push-response');
+        return initial.some((record) => record.serverId === 'discord')
+          && initial.some((record) => record.serverId === 'heartbeat');
+      });
+
+      const batch = outbox.prepare({
+        agentName: 'assistant',
+        sourceBranch: 'source',
+        targetBranch: 'main',
+        activationPolicy: 'explicit',
+        refs: [{
+          serverId: 'discord',
+          channelId: 'discord:guild:startup',
+          messageId: `runtime-global-${dataMethod}`,
+        }],
+      });
+      assert.ok(batch);
+      outbox.activate(batch.id);
+      writeFileSync(listChangePath, 'change');
+
+      await waitFor('Discord marker call for heartbeat generation', () =>
+        records(statusPath).some((record) =>
+          record.serverId === 'discord' && record.event === 'reaction-call'));
+      assert.equal(
+        records(statusPath).some((record) =>
+          record.serverId === 'heartbeat' && record.event === 'list-change-push-response'),
+        false,
+        `fresh heartbeat ${dataMethod} must wait for Discord accounting`,
+      );
+
+      writeFileSync(releasePath, 'release');
+      await waitFor('globally gated runtime response', () =>
+        records(statusPath).some((record) =>
+          record.serverId === 'heartbeat' && record.event === 'list-change-push-response'));
+      const response = records(statusPath).find((record) =>
+        record.serverId === 'heartbeat' && record.event === 'list-change-push-response');
+      assert.equal(response?.method, dataMethod);
+      assert.equal(response?.ledgerStatus, 'applied');
+      assert.equal(outbox.pending('discord').length, 0);
+    } finally {
+      await framework?.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test('reconnect pauses fresh inbound data but permits registration and awareness tool service', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
@@ -549,8 +693,8 @@ test('a control flush that installs a newer generation cannot be released by the
   const oldDrain = deferred<any>();
   const newDrain = deferred<any>();
   const framework = Object.create(AgentFramework.prototype) as any;
-  framework.discordAwarenessBarriers = new Map();
-  framework.discordAwarenessBarrierGenerations = new Map();
+  framework.discordAwarenessBarrier = null;
+  framework.discordAwarenessBarrierGeneration = 0;
   const drains = [oldDrain.promise, newDrain.promise];
   framework.beginDiscordAwarenessBarrier = () => ({
     requiresBarrier: true,
@@ -565,23 +709,24 @@ test('a control flush that installs a newer generation cannot be released by the
     ready: () => { readyCalls++; },
     readyControlPlane: () => {
       if (newer) return;
-      newer = framework.installMcplDataPlaneGate(connection);
-      framework.releaseMcplDataPlaneGate(connection, newer);
+      newer = framework.installMcplDataPlaneGate();
+      framework.releaseMcplDataPlaneGate(newer);
     },
   };
+  framework.mcplServerRegistry = { getAllServers: () => [connection] };
 
-  const older = framework.installMcplDataPlaneGate(connection);
-  framework.releaseMcplDataPlaneGate(connection, older);
+  const older = framework.installMcplDataPlaneGate();
+  framework.releaseMcplDataPlaneGate(older);
   assert.equal(newer.generation, older.generation + 1);
 
   oldDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
   await older.promise;
-  assert.equal(framework.completeMcplDataPlaneGate(connection, older), false);
+  assert.equal(framework.completeMcplDataPlaneGate(older), false);
   assert.equal(readyCalls, 0, 'old completion leaves fresh data held');
 
   newDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
   await newer.promise;
-  assert.equal(framework.completeMcplDataPlaneGate(connection, newer), true);
+  assert.equal(framework.completeMcplDataPlaneGate(newer), true);
   assert.equal(readyCalls, 1);
 });
 
@@ -589,8 +734,8 @@ test('overlapping reconnect/list-change generations release only the newest barr
   const reconnectDrain = deferred<any>();
   const listChangeDrain = deferred<any>();
   const framework = Object.create(AgentFramework.prototype) as any;
-  framework.discordAwarenessBarriers = new Map();
-  framework.discordAwarenessBarrierGenerations = new Map();
+  framework.discordAwarenessBarrier = null;
+  framework.discordAwarenessBarrierGeneration = 0;
   const drains = [reconnectDrain.promise, listChangeDrain.promise];
   framework.beginDiscordAwarenessBarrier = () => ({
     requiresBarrier: true,
@@ -603,20 +748,21 @@ test('overlapping reconnect/list-change generations release only the newest barr
     readyControlPlane: () => {},
     ready: () => { readyCalls++; },
   };
+  framework.mcplServerRegistry = { getAllServers: () => [connection] };
 
-  const reconnectBarrier = framework.installMcplDataPlaneGate(connection);
-  framework.releaseMcplDataPlaneGate(connection, reconnectBarrier);
-  const listChangeBarrier = framework.installMcplDataPlaneGate(connection);
-  framework.releaseMcplDataPlaneGate(connection, listChangeBarrier);
+  const reconnectBarrier = framework.installMcplDataPlaneGate();
+  framework.releaseMcplDataPlaneGate(reconnectBarrier);
+  const listChangeBarrier = framework.installMcplDataPlaneGate();
+  framework.releaseMcplDataPlaneGate(listChangeBarrier);
 
   reconnectDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
   await reconnectBarrier.promise;
-  framework.completeMcplDataPlaneGate(connection, reconnectBarrier);
+  framework.completeMcplDataPlaneGate(reconnectBarrier);
   assert.equal(readyCalls, 0, 'reconnect completion cannot bypass overlapping list-change work');
 
   listChangeDrain.resolve({ status: 'delivered', delivered: 1, failed: 0 });
   await listChangeBarrier.promise;
-  framework.completeMcplDataPlaneGate(connection, listChangeBarrier);
+  framework.completeMcplDataPlaneGate(listChangeBarrier);
   assert.equal(readyCalls, 1);
 });
 

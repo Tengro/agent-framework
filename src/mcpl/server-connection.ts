@@ -69,6 +69,13 @@ interface PendingRequest {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+interface RequestOptions {
+  /** Override the connection-wide timeout for this request only. */
+  timeoutMs?: number;
+  /** Surface a late response even when it carries no checkpoint state. */
+  surfaceOrphanedResponse?: boolean;
+}
+
 /**
  * McplServerConnection manages a single JSON-RPC 2.0 connection to an
  * MCPL server over stdio. Use the static `connect()` factory to create
@@ -107,6 +114,9 @@ export class McplServerConnection extends EventEmitter {
 
   private nextRequestId = 1;
   private pendingRequests = new Map<string | number, PendingRequest>();
+  /** Metadata retained after selected request deadlines so a late response is
+   * observable even though its original promise has already been rejected. */
+  private orphanedRequests = new Map<string | number, { method: string }>();
   private closed = false;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
@@ -538,6 +548,26 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest('tools/call', params) as Promise<McpToolCallResult>;
   }
 
+  /**
+   * Send a tools/call with a mandatory request-local deadline. This is used by
+   * durable external-side-effect accounting, whose safety bound must remain in
+   * force even when the server's general requestTimeoutMs is configured as 0.
+   */
+  sendToolsCallWithDeadline(
+    name: string,
+    args: Record<string, unknown>,
+    timeoutMs: number,
+  ): Promise<McpToolCallResult> {
+    const params: Record<string, unknown> = { name, arguments: args };
+    const mandatoryTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.max(1, Math.floor(timeoutMs))
+      : 1;
+    return this.sendRequest('tools/call', params, {
+      timeoutMs: mandatoryTimeoutMs,
+      surfaceOrphanedResponse: true,
+    }) as Promise<McpToolCallResult>;
+  }
+
   // ==========================================================================
   // Lifecycle
   // ==========================================================================
@@ -562,6 +592,7 @@ export class McplServerConnection extends EventEmitter {
       pending.reject(new Error(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`));
     }
     this.pendingRequests.clear();
+    this.orphanedRequests.clear();
 
     // Tear down the transport (kills the child / closes the socket). The
     // transport's own 'close' event is short-circuited by `this.closed` in
@@ -675,7 +706,11 @@ export class McplServerConnection extends EventEmitter {
    * the framework maps the rejection to an isError tool_result, so a hung tool
    * surfaces as a normal tool error and the turn completes.
    */
-  private sendRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private sendRequest(
+    method: string,
+    params: Record<string, unknown>,
+    options: RequestOptions = {},
+  ): Promise<unknown> {
     if (this.closed) {
       return Promise.reject(new Error(`Cannot send request: connection to "${this.id}" is closed`));
     }
@@ -690,18 +725,22 @@ export class McplServerConnection extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = { resolve, reject, method };
-      if (this.requestTimeoutMs > 0) {
+      const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
+      if (timeoutMs > 0) {
         pending.timer = setTimeout(() => {
           this.pendingRequests.delete(id);
+          if (options.surfaceOrphanedResponse) {
+            this.orphanedRequests.set(id, { method });
+          }
           reject(new Error(
             `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
-            `within ${this.requestTimeoutMs}ms — the server may be hung. ` +
-            `The request was abandoned; the connection remains open. Note the ` +
-            `tool may still have completed server-side (this is only a response ` +
-            `timeout, not a cancellation) — verify state before retrying, as a ` +
-            `blind retry of a stateful/side-effecting tool may duplicate it.`,
+            `within ${timeoutMs}ms — the server may be hung. The response ` +
+            `outcome is unknown: the request was abandoned locally but was not ` +
+            `cancelled, so the tool may still have completed server-side; verify ` +
+            `state before retrying; a blind retry of a stateful/side-effecting ` +
+            `tool may duplicate it.`,
           ));
-        }, this.requestTimeoutMs);
+        }, timeoutMs);
         // Don't hold the event loop open for the watchdog alone.
         pending.timer.unref?.();
       }
@@ -809,23 +848,31 @@ export class McplServerConnection extends EventEmitter {
     const pending = this.pendingRequests.get(response.id);
     if (!pending) {
       // Orphaned response — the request already timed out (or was settled) and
-      // was removed from pendingRequests. Stateless late results are harmless to
-      // drop, but a late STATEFUL result carries a `state`/`checkpoint` the
-      // server has already advanced to: dropping it silently diverges the host's
-      // checkpoint tree from the server's, and every subsequent call then sends
-      // stale state. We can't safely re-inject it here (the dispatch context is
-      // gone), but we surface it so the divergence is greppable instead of
-      // invisible.
+      // was removed from pendingRequests. A late STATEFUL result must be
+      // surfaced because dropping it silently diverges the checkpoint tree.
+      // Selected side-effecting calls are also surfaced even without state so
+      // their outcome-unknown receipt remains visible. We cannot safely
+      // re-inject either result because the original dispatch context is gone.
+      const orphaned = this.orphanedRequests.get(response.id);
+      this.orphanedRequests.delete(response.id);
       const result = response.result;
       if (result && typeof result === 'object') {
         const r = result as { state?: unknown; checkpoint?: unknown };
-        if (r.state !== undefined || r.checkpoint !== undefined) {
+        if (orphaned || r.state !== undefined || r.checkpoint !== undefined) {
           this.emit('orphaned-response', {
             id: response.id,
+            method: orphaned?.method,
             hadState: r.state !== undefined,
             hadCheckpoint: r.checkpoint !== undefined,
           });
         }
+      } else if (orphaned) {
+        this.emit('orphaned-response', {
+          id: response.id,
+          method: orphaned.method,
+          hadState: false,
+          hadCheckpoint: false,
+        });
       }
       return; // Orphaned response — ignore
     }
@@ -892,6 +939,7 @@ export class McplServerConnection extends EventEmitter {
           );
         }
         this.pendingRequests.clear();
+        this.orphanedRequests.clear();
 
         this.emit('close', info.code ?? null, info.signal ?? null);
 

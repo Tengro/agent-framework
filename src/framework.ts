@@ -123,6 +123,9 @@ const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
 /** Maximum number of turn checkpoints to keep per agent. */
 const MAX_TURN_CHECKPOINTS = 20;
+const DEFAULT_DISCORD_AWARENESS_DEADLINE_MS = 10_000;
+const MIN_DISCORD_AWARENESS_DEADLINE_MS = 50;
+const MAX_DISCORD_AWARENESS_DEADLINE_MS = 60_000;
 
 interface TurnCheckpoint {
   agentName: string;
@@ -140,6 +143,16 @@ interface DiscordAwarenessBarrier {
   generation: number;
   requiresBarrier: boolean;
   promise: Promise<DiscordAwarenessDrainOutcome>;
+}
+
+function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
+  }
+  return Math.max(
+    MIN_DISCORD_AWARENESS_DEADLINE_MS,
+    Math.min(MAX_DISCORD_AWARENESS_DEADLINE_MS, Math.floor(value)),
+  );
 }
 
 class DiscordAwarenessAccountingError extends Error {
@@ -478,11 +491,12 @@ export class AgentFramework {
   /** Durable, non-Chronicle projection queue for messages removed by a branch. */
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
+  private discordAwarenessDeadlineMs = DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
-  /** Current generation of each inference gate; older completions cannot release it. */
-  private discordAwarenessBarriers: Map<string, DiscordAwarenessBarrier> = new Map();
-  private discordAwarenessBarrierGenerations: Map<string, number> = new Map();
+  /** Framework-global inference gate; older generations cannot release it. */
+  private discordAwarenessBarrier: DiscordAwarenessBarrier | null = null;
+  private discordAwarenessBarrierGeneration = 0;
 
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
@@ -505,6 +519,7 @@ export class AgentFramework {
     timeZone: string,
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
     discordAwarenessEmoji: string,
+    discordAwarenessDeadlineMs: number,
   ) {
     this.store = store;
     this.ownsStore = ownsStore;
@@ -518,6 +533,7 @@ export class AgentFramework {
     this.timeZone = timeZone;
     this.discordAwarenessOutbox = discordAwarenessOutbox;
     this.discordAwarenessEmoji = discordAwarenessEmoji;
+    this.discordAwarenessDeadlineMs = discordAwarenessDeadlineMs;
     this.queue = new ProcessQueueImpl();
     this.usageTracker = new UsageTracker({
       emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
@@ -618,6 +634,7 @@ export class AgentFramework {
       resolveTimeZone(config.timeZone),
       discordAwarenessOutbox,
       config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
+      normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
     );
 
     // If an offline recovery process crashed after switching Chronicle but
@@ -5511,7 +5528,11 @@ export class AgentFramework {
 
     for (const config of serverConfigs) {
       try {
-        await this.connectMcplServerInternal(config);
+        // Stage every startup connection with both planes closed. This removes
+        // server-order dependence: no early heartbeat/shell push can become
+        // model-visible before a later Discord connection has joined the same
+        // awareness generation.
+        await this.connectMcplServerInternal(config, true);
       } catch (error) {
         if (error instanceof DiscordAwarenessAccountingError) {
           await this.mcplServerRegistry.closeAll();
@@ -5534,21 +5555,38 @@ export class AgentFramework {
       }
     }
 
+    // Start the durable drain only after all startup connections are staged.
+    // The awareness tools/call is written before control-plane registration is
+    // flushed, preserving the server-side queue -> registration -> call order.
+    const startupBarrier = this.installMcplDataPlaneGate();
+    this.releaseMcplDataPlaneGate(startupBarrier);
+    try {
+      await startupBarrier.promise;
+      this.completeMcplDataPlaneGate(startupBarrier);
+    } catch (error) {
+      await this.mcplServerRegistry.closeAll();
+      throw error;
+    }
+
     // Discover tools from all connected servers
     await this.refreshMcplTools();
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
-  async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
+  async syncDiscordAwarenessMarkers(_onlyServerId?: string): Promise<void> {
     if (!this.discordAwarenessOutbox) return;
-    this.discordAwarenessOutbox.reconcileForBranch(
-      this.store.currentBranch().name,
-      this.store.listBranches(),
-    );
-    const serverIds = onlyServerId
-      ? [onlyServerId]
-      : [...new Set(this.discordAwarenessOutbox.pending().map((operation) => operation.ref.serverId))];
-    await Promise.all(serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
+    // A targeted retry may discover pending work for other Discord servers
+    // during reconciliation. Safety is global, so one generation accounts for
+    // all pending operations before releasing any MCPL data plane.
+    const barrier = this.installMcplDataPlaneGate();
+    this.releaseMcplDataPlaneGate(barrier);
+    try {
+      await barrier.promise;
+      this.completeMcplDataPlaneGate(barrier);
+    } catch (error) {
+      await this.failMcplDataPlaneGate(barrier, 'explicit synchronization', error);
+      throw error;
+    }
   }
 
   private async resumePreparedDiscordSuppressions(): Promise<void> {
@@ -5638,11 +5676,11 @@ export class AgentFramework {
           let deliveryError: string | undefined;
           try {
             const tool = operation.action === 'add' ? 'add_reaction' : 'remove_reaction';
-            const result = await connection.sendToolsCall(tool, {
+            const result = await connection.sendToolsCallWithDeadline(tool, {
               channelId,
               messageId: ref.messageId,
               emoji: operation.emoji,
-            });
+            }, this.discordAwarenessDeadlineMs);
             if (result.isError) {
               deliveryError = result.content
                 .map((content) => content.text ?? '')
@@ -5687,11 +5725,14 @@ export class AgentFramework {
     return drain;
   }
 
-  private readDiscordAwarenessPending(serverId: string) {
+  private readDiscordAwarenessPending(serverId?: string) {
     try {
       return this.discordAwarenessOutbox!.pending(serverId);
     } catch (error) {
-      throw new DiscordAwarenessAccountingError(`ledger read for ${serverId}`, error);
+      throw new DiscordAwarenessAccountingError(
+        `ledger read${serverId ? ` for ${serverId}` : ''}`,
+        error,
+      );
     }
   }
 
@@ -5727,7 +5768,7 @@ export class AgentFramework {
     }
   }
 
-  private beginDiscordAwarenessBarrier(serverId: string): {
+  private beginDiscordAwarenessBarrier(): {
     requiresBarrier: boolean;
     promise: Promise<DiscordAwarenessDrainOutcome>;
   } {
@@ -5743,36 +5784,59 @@ export class AgentFramework {
         this.store.listBranches(),
       );
     } catch (error) {
-      throw new DiscordAwarenessAccountingError(`branch reconciliation for ${serverId}`, error);
+      throw new DiscordAwarenessAccountingError('branch reconciliation', error);
     }
-    if (this.readDiscordAwarenessPending(serverId).length === 0) {
+    const pending = this.readDiscordAwarenessPending();
+    if (pending.length === 0) {
       return {
         requiresBarrier: false,
         promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
       };
     }
-    return { requiresBarrier: true, promise: this.drainDiscordAwarenessOutbox(serverId) };
-  }
-
-  private getDiscordAwarenessBarrier(serverId: string): DiscordAwarenessBarrier | undefined {
-    return this.discordAwarenessBarriers?.get(serverId);
+    const serverIds = [...new Set(pending.map((operation) => operation.ref.serverId))];
+    const promise = Promise.all(
+      serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)),
+    ).then((outcomes): DiscordAwarenessDrainOutcome => {
+      if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
+        return {
+          status: 'unavailable',
+          accounted: outcomes.reduce(
+            (count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0),
+            0,
+          ),
+        };
+      }
+      return {
+        status: 'delivered',
+        delivered: outcomes.reduce(
+          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0),
+          0,
+        ),
+        failed: outcomes.reduce(
+          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0),
+          0,
+        ),
+      };
+    });
+    return { requiresBarrier: true, promise };
   }
 
   /**
-   * Install a Discord-awareness gate before releasing any inference-bearing
-   * event. With pending work, only the MCPL control plane is released until the
-   * durable drain settles. With no pending work, ready() runs synchronously so
-   * request responders preserve their historical same-stack behavior.
+   * Install one framework-global Discord-awareness generation before releasing
+   * any inference-bearing event. With pending work, every MCPL data plane is
+   * paused while all control planes remain live. With no pending work, ready()
+   * runs synchronously so request responders preserve their historical
+   * same-stack behavior.
    */
-  private installMcplDataPlaneGate(connection: McplServerConnection): DiscordAwarenessBarrier {
-    connection.pauseDataPlane();
-    const generations = this.discordAwarenessBarrierGenerations ??= new Map();
-    const generation = (generations.get(connection.id) ?? 0) + 1;
-    generations.set(connection.id, generation);
+  private installMcplDataPlaneGate(): DiscordAwarenessBarrier {
+    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+      connection.pauseDataPlane();
+    }
+    const generation = ++this.discordAwarenessBarrierGeneration;
 
     let begun: ReturnType<AgentFramework['beginDiscordAwarenessBarrier']>;
     try {
-      begun = this.beginDiscordAwarenessBarrier(connection.id);
+      begun = this.beginDiscordAwarenessBarrier();
     } catch (error) {
       begun = {
         requiresBarrier: true,
@@ -5780,55 +5844,62 @@ export class AgentFramework {
       };
     }
     const barrier: DiscordAwarenessBarrier = { generation, ...begun };
-    (this.discordAwarenessBarriers ??= new Map()).set(connection.id, barrier);
+    this.discordAwarenessBarrier = barrier;
     return barrier;
   }
 
   private releaseMcplDataPlaneGate(
-    connection: McplServerConnection,
     barrier: DiscordAwarenessBarrier,
   ): void {
-    if (this.getDiscordAwarenessBarrier(connection.id) !== barrier) {
-      return;
-    }
+    if (this.discordAwarenessBarrier !== barrier) return;
     if (barrier.requiresBarrier) {
-      connection.readyControlPlane();
+      for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+        connection.readyControlPlane();
+      }
       return;
     }
-    this.discordAwarenessBarriers.delete(connection.id);
-    connection.ready();
+    this.completeMcplDataPlaneGate(barrier);
   }
 
   private completeMcplDataPlaneGate(
-    connection: McplServerConnection,
     barrier: DiscordAwarenessBarrier,
   ): boolean {
-    if (this.getDiscordAwarenessBarrier(connection.id) !== barrier) return false;
-    this.discordAwarenessBarriers.delete(connection.id);
-    connection.ready();
-    return true;
+    if (this.discordAwarenessBarrier !== barrier) return false;
+    this.discordAwarenessBarrier = null;
+    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+      // ready() can synchronously flush a nested list-change notification that
+      // installs a newer global generation. Never let this older completion
+      // release any remaining server behind that newer gate.
+      if (this.discordAwarenessBarrier !== null) return false;
+      connection.ready();
+    }
+    return this.discordAwarenessBarrier === null;
   }
 
   private async failMcplDataPlaneGate(
-    connection: McplServerConnection,
     barrier: DiscordAwarenessBarrier,
     context: string,
     error: unknown,
   ): Promise<void> {
-    if (this.getDiscordAwarenessBarrier(connection.id) !== barrier) return;
+    if (this.discordAwarenessBarrier !== barrier) return;
     const err = error instanceof Error ? error : new Error(String(error));
-    console.error(`[discord-awareness] ${context} failed for ${connection.id}:`, err.message);
-    this.emitTrace({
-      type: 'mcpl:server-error',
-      serverId: connection.id,
-      error: `Discord awareness accounting unhealthy: ${err.message}`,
-    });
-    await connection.reconnectAfterFailure().catch((closeError) => {
-      console.error(
-        `[discord-awareness] could not recycle unhealthy connection ${connection.id}:`,
-        closeError instanceof Error ? closeError.message : closeError,
-      );
-    });
+    console.error(`[discord-awareness] ${context} failed globally:`, err.message);
+    const connections = this.mcplServerRegistry?.getAllServers() ?? [];
+    for (const connection of connections) {
+      this.emitTrace({
+        type: 'mcpl:server-error',
+        serverId: connection.id,
+        error: `Discord awareness accounting unhealthy: ${err.message}`,
+      });
+    }
+    await Promise.all(connections.map(async (connection) => {
+      await connection.reconnectAfterFailure().catch((closeError) => {
+        console.error(
+          `[discord-awareness] could not recycle unhealthy connection ${connection.id}:`,
+          closeError instanceof Error ? closeError.message : closeError,
+        );
+      });
+    }));
   }
 
   /**
@@ -5839,6 +5910,7 @@ export class AgentFramework {
    */
   private async connectMcplServerInternal(
     config: import('./mcpl/types.js').McplServerConfig,
+    deferAwareness = false,
   ): Promise<void> {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       throw new Error('MCPL subsystem is not initialized');
@@ -5861,19 +5933,23 @@ export class AgentFramework {
 
     const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
 
-    // Wire listeners, install the inference gate synchronously, then release
-    // control traffic so registration can complete and the same server can
-    // service awareness tools/call requests.
+    // Wire listeners before either startup staging or the runtime global gate
+    // releases control traffic needed for registration and marker service.
     this.wireMcplEvents(connection);
 
     // Initialize feature sets if server advertises MCPL capabilities
     this.registerMcplServerFeatures(config, connection);
 
-    const awarenessBarrier = this.installMcplDataPlaneGate(connection);
-    this.releaseMcplDataPlaneGate(connection, awarenessBarrier);
+    if (deferAwareness) {
+      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      return;
+    }
+
+    const awarenessBarrier = this.installMcplDataPlaneGate();
+    this.releaseMcplDataPlaneGate(awarenessBarrier);
     try {
       await awarenessBarrier.promise;
-      this.completeMcplDataPlaneGate(connection, awarenessBarrier);
+      this.completeMcplDataPlaneGate(awarenessBarrier);
     } catch (error) {
       // Startup cannot fail open on a broken awareness ledger. Disable the
       // reconnecting stub/connection before propagating the distinct error to
@@ -6099,7 +6175,7 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const barrier = this.getDiscordAwarenessBarrier(connection.id);
+      const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
       this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
@@ -6110,7 +6186,7 @@ export class AgentFramework {
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (this.inferenceRouter && responder) {
-        const barrier = this.getDiscordAwarenessBarrier(connection.id);
+        const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
           respond: responder.respond,
@@ -6138,7 +6214,7 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      const barrier = this.getDiscordAwarenessBarrier(connection.id);
+      const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
       this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
@@ -6150,7 +6226,7 @@ export class AgentFramework {
     ) => {
       if (!responder) return;
       try {
-        const barrier = this.getDiscordAwarenessBarrier(connection.id);
+        const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
         const result = await this.handleHostCommand(connection.id, params ?? {});
         responder.respond(result);
@@ -6165,13 +6241,12 @@ export class AgentFramework {
       // Pause before starting any async refresh. This listener runs
       // synchronously in the transport line callback, so a following inbound
       // data event cannot pass before the new barrier exists.
-      const awarenessBarrier = this.installMcplDataPlaneGate(connection);
-      this.releaseMcplDataPlaneGate(connection, awarenessBarrier);
+      const awarenessBarrier = this.installMcplDataPlaneGate();
+      this.releaseMcplDataPlaneGate(awarenessBarrier);
       this.handleToolsListChanged(connection.id);
       void awarenessBarrier.promise.then(() => {
-        this.completeMcplDataPlaneGate(connection, awarenessBarrier);
+        this.completeMcplDataPlaneGate(awarenessBarrier);
       }).catch((error) => this.failMcplDataPlaneGate(
-        connection,
         awarenessBarrier,
         'tools-list reconciliation',
         error,
@@ -6189,7 +6264,7 @@ export class AgentFramework {
       // Install the barrier synchronously so any inbound event emitted after
       // reconnect observes it before doing work that could wake an agent. The
       // connection paused its data plane before wiring the fresh transport.
-      const awarenessBarrier = this.installMcplDataPlaneGate(connection);
+      const awarenessBarrier = this.installMcplDataPlaneGate();
       try {
         const config = this.mcplServerConfigs.get(connection.id);
         if (config) {
@@ -6201,12 +6276,12 @@ export class AgentFramework {
           error instanceof Error ? error.message : error,
         );
       }
-      this.releaseMcplDataPlaneGate(connection, awarenessBarrier);
+      this.releaseMcplDataPlaneGate(awarenessBarrier);
       this.handleToolsListChanged(connection.id);
       void awarenessBarrier.promise.then(() => {
         if (
           awarenessBarrier.requiresBarrier
-          && !this.completeMcplDataPlaneGate(connection, awarenessBarrier)
+          && !this.completeMcplDataPlaneGate(awarenessBarrier)
         ) return;
         this.emitTrace({
           type: 'mcpl:server-reconnected',
@@ -6217,7 +6292,6 @@ export class AgentFramework {
         // consumers see the server come back, not just vanish.
         this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
       }).catch((error) => this.failMcplDataPlaneGate(
-        connection,
         awarenessBarrier,
         'reconnect reconciliation',
         error,
@@ -6263,6 +6337,7 @@ export class AgentFramework {
     // divergence greppable instead of a silent drift into stale state.
     connection.on('orphaned-response', (info: {
       id: string | number;
+      method?: string;
       hadState: boolean;
       hadCheckpoint: boolean;
     }) => {
@@ -6270,6 +6345,7 @@ export class AgentFramework {
         type: 'mcpl:orphaned-response',
         serverId: connection.id,
         responseId: info.id,
+        method: info.method,
         hadState: info.hadState,
         hadCheckpoint: info.hadCheckpoint,
       });

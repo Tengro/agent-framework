@@ -81,7 +81,6 @@ function makeHarness() {
   fw.mcplTools = [];
   fw.mcplToolRefreshInFlight = false;
   fw.mcplToolRefreshPending = false;
-  fw.mcplServerRegistry = null; // handleToolsListChanged no-ops without it
   fw.channelRegistry = null;
   fw.inferenceRouter = null;
   fw.eventGate = null;
@@ -104,6 +103,12 @@ function makeHarness() {
   fw.mcplServerConfigs = new Map([[config.id, config]]);
 
   const connection = new FakeConnection('srv');
+  fw.mcplServerRegistry = {
+    getAllServers: () => [connection],
+    getServer: (id: string) => id === connection.id ? connection : null,
+  };
+  fw.discordAwarenessBarrier = null;
+  fw.discordAwarenessBarrierGeneration = 0;
   fw.wireMcplEvents(connection);
   fw.registerMcplServerFeatures(config, connection);
 

@@ -11,6 +11,9 @@ const permanentReaction = process.env.PERMANENT_REACTION === '1';
 const failInitialGeneration = process.env.FAIL_INITIAL_GENERATION === '1';
 const nestedListChangeGeneration = Number(process.env.NESTED_LIST_CHANGE_GENERATION ?? 0);
 const dataMethod = process.env.DATA_METHOD ?? 'push/event';
+const serverId = process.env.SERVER_ID ?? 'discord';
+const arrivalPath = process.env.ARRIVAL_PATH;
+const waitForArrivalPath = process.env.WAIT_FOR_ARRIVAL_PATH;
 
 let generation = 1;
 if (generationPath) {
@@ -24,14 +27,14 @@ if (generationPath) {
 
 const log = (event, extra = {}) => {
   if (!statusPath) return;
-  appendFileSync(statusPath, JSON.stringify({ event, generation, ...extra }) + '\n');
+  appendFileSync(statusPath, JSON.stringify({ event, generation, serverId, ...extra }) + '\n');
 };
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
 const request = (id, method, params) => send({ jsonrpc: '2.0', id, method, params });
 const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
 const channel = (suffix) => ({
-  id: `discord:guild:${suffix}`,
-  type: 'discord',
+  id: `${serverId}:guild:${suffix}`,
+  type: serverId,
   label: suffix,
   direction: 'bidirectional',
 });
@@ -43,7 +46,9 @@ if (failInitialGeneration && generation === 1) {
 
 let initialized = false;
 let registered = false;
+let registrationReceived = false;
 let pendingToolRequest = null;
+let reactionQueued = false;
 let pendingControl = false;
 let listChangeTriggered = false;
 let reactionOrdinal = 0;
@@ -76,9 +81,16 @@ function maybeReplyToReaction() {
 }
 
 function serviceReaction(message) {
+  if (waitForArrivalPath && !existsSync(waitForArrivalPath)) {
+    pendingToolRequest = message;
+    return;
+  }
   if (!registered) {
     pendingToolRequest = message;
-    log('reaction-queued-before-registration');
+    if (!reactionQueued) {
+      reactionQueued = true;
+      log('reaction-queued-before-registration');
+    }
     return;
   }
   reactionOrdinal++;
@@ -98,6 +110,17 @@ function serviceReaction(message) {
   }
 }
 
+function maybeFinishRegistration() {
+  if (!registrationReceived || registered) return;
+  if (pendingToolRequest && waitForArrivalPath && !existsSync(waitForArrivalPath)) return;
+  if (pendingToolRequest && !reactionQueued) serviceReaction(pendingToolRequest);
+  registered = true;
+  log('registration-response');
+  const queued = pendingToolRequest;
+  pendingToolRequest = null;
+  if (queued) serviceReaction(queued);
+}
+
 function sendDataRequest(id, phase) {
   let params;
   if (dataMethod === 'inference/request') {
@@ -108,8 +131,8 @@ function sendDataRequest(id, phase) {
   } else if (dataMethod === 'channels/incoming') {
     params = {
       messages: [{
-        channelId: 'discord:guild:startup',
-        messageId: `${phase}-incoming-${generation}`,
+        channelId: `${serverId}:guild:startup`,
+        messageId: `${serverId}-${phase}-incoming-${generation}`,
         author: { id: 'human', name: 'Human' },
         timestamp: new Date().toISOString(),
         content: [{ type: 'text', text: `must wait for ${phase} awareness` }],
@@ -120,11 +143,13 @@ function sendDataRequest(id, phase) {
   } else {
     params = {
       featureSet: 'chat',
-      eventId: `${phase}-push-${generation}`,
+      eventId: `${serverId}-${phase}-push-${generation}`,
       timestamp: new Date().toISOString(),
       payload: { content: [{ type: 'text', text: `must wait for ${phase} awareness` }] },
     };
   }
+  log('data-request-sent', { method: dataMethod, phase });
+  if (arrivalPath) writeFileSync(arrivalPath, `${serverId}:${dataMethod}:${phase}`);
   request(id, dataMethod, params);
 }
 
@@ -174,11 +199,8 @@ function handle(message) {
     return;
   }
   if (message.id === 200) {
-    registered = true;
-    log('registration-response');
-    const queued = pendingToolRequest;
-    pendingToolRequest = null;
-    if (queued) serviceReaction(queued);
+    registrationReceived = true;
+    maybeFinishRegistration();
     return;
   }
   if (message.id === 201) {
@@ -216,6 +238,10 @@ process.stdin.on('data', (chunk) => {
 });
 
 const timer = setInterval(() => {
+  if (pendingToolRequest && !registered && waitForArrivalPath && existsSync(waitForArrivalPath)) {
+    serviceReaction(pendingToolRequest);
+    maybeFinishRegistration();
+  }
   maybeReplyToReaction();
   if (listChangePath && existsSync(listChangePath) && !listChangeTriggered) {
     listChangeTriggered = true;
