@@ -47,6 +47,7 @@ import type {
   AgentRuntimeSettingsPatch,
   AgentRuntimeSettingsOverrides,
   AgentRuntimeSettingsSnapshot,
+  AgentSettingsExtension,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
@@ -1093,8 +1094,79 @@ export class AgentFramework {
       ...this.mcplTools,
       ...channelTools,
       ...gateTools,
-      AgentFramework.AGENT_SETTINGS_TOOL,
+      this.buildAgentSettingsTool(),
     ];
+  }
+
+  /** Core agent_settings keys — extension keys must not collide with these. */
+  private static readonly AGENT_SETTINGS_CORE_KEYS = [
+    'context_budget_tokens',
+    'tail_tokens',
+    'transition_pace_tokens',
+  ];
+
+  /**
+   * Collect module-declared agent_settings extensions (Module.getAgentSettingsExtension),
+   * keyed by owning module name. Extensions whose keys collide with the core
+   * settings or an earlier extension are skipped loudly — silent shadowing
+   * would make updates route to the wrong owner.
+   */
+  private collectAgentSettingsExtensions(): Map<string, AgentSettingsExtension> {
+    const result = new Map<string, AgentSettingsExtension>();
+    const taken = new Set<string>(AgentFramework.AGENT_SETTINGS_CORE_KEYS);
+    for (const module of this.moduleRegistry.getAllModules()) {
+      const ext = module.getAgentSettingsExtension?.();
+      if (!ext) continue;
+      const collision = ext.keys.find((k) => taken.has(k));
+      if (collision) {
+        console.error(
+          `[agent-settings] extension from module '${module.name}' skipped: key '${collision}' already taken`,
+        );
+        continue;
+      }
+      ext.keys.forEach((k) => taken.add(k));
+      result.set(module.name, ext);
+    }
+    return result;
+  }
+
+  /** agent_settings tool definition with module extension fields merged in. */
+  private buildAgentSettingsTool(): import('./types/index.js').ToolDefinition {
+    const base = AgentFramework.AGENT_SETTINGS_TOOL;
+    const extensions = this.collectAgentSettingsExtensions();
+    if (extensions.size === 0) return base;
+    const baseSchema = base.inputSchema as {
+      type: string;
+      properties: Record<string, unknown>;
+      required?: string[];
+    };
+    const extProperties: Record<string, unknown> = {};
+    const extKeys: string[] = [];
+    for (const ext of extensions.values()) {
+      Object.assign(extProperties, ext.properties);
+      extKeys.push(...ext.keys);
+    }
+    const settingsProp = baseSchema.properties.settings as { items?: { enum?: string[] } };
+    return {
+      ...base,
+      description:
+        base.description +
+        ` Additional host-managed settings also live here: ${extKeys.join(', ')}.`,
+      inputSchema: {
+        ...baseSchema,
+        properties: {
+          ...baseSchema.properties,
+          ...extProperties,
+          settings: {
+            ...(baseSchema.properties.settings as Record<string, unknown>),
+            items: {
+              ...(settingsProp.items as Record<string, unknown>),
+              enum: [...(settingsProp.items?.enum ?? []), ...extKeys],
+            },
+          },
+        },
+      } as unknown as import('./types/index.js').ToolDefinition['inputSchema'],
+    };
   }
 
   getAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsSnapshot {
@@ -6575,10 +6647,20 @@ export class AgentFramework {
         tail_tokens?: unknown;
         transition_pace_tokens?: unknown;
         settings?: unknown;
+      } & Record<string, unknown>;
+      const extensions = this.collectAgentSettingsExtensions();
+      /** Extension values merged flat alongside the core snapshot. */
+      const extGet = (): Record<string, unknown> => {
+        const out: Record<string, unknown> = {};
+        for (const ext of extensions.values()) Object.assign(out, ext.get(agentName));
+        return out;
       };
       switch (input.action) {
         case 'get':
-          result = { success: true, data: this.getAgentRuntimeSettings(agentName) };
+          result = {
+            success: true,
+            data: { ...this.getAgentRuntimeSettings(agentName), ...extGet() },
+          };
           break;
         case 'cancel':
           result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
@@ -6592,11 +6674,29 @@ export class AgentFramework {
           if (input.transition_pace_tokens !== undefined) {
             patch.transitionPaceTokens = Number(input.transition_pace_tokens);
           }
-          result = { success: true, data: this.updateAgentRuntimeSettings(agentName, patch) };
+          // Route extension-owned keys to their modules; apply the core patch
+          // only when it touches core keys (an extension-only update must not
+          // disturb a converging budget transition).
+          const extResults: Record<string, unknown> = {};
+          for (const ext of extensions.values()) {
+            const slice: Record<string, unknown> = {};
+            for (const key of ext.keys) {
+              if (input[key] !== undefined) slice[key] = input[key];
+            }
+            if (Object.keys(slice).length > 0) {
+              Object.assign(extResults, ext.update(agentName, slice));
+            }
+          }
+          const coreTouched = Object.keys(patch).length > 0;
+          const core = coreTouched
+            ? this.updateAgentRuntimeSettings(agentName, patch)
+            : this.getAgentRuntimeSettings(agentName);
+          result = { success: true, data: { ...core, ...extGet(), ...extResults } };
           break;
         }
         case 'reset': {
           let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
+          const extResetKeys = new Map<AgentSettingsExtension, string[]>();
           if (input.settings !== undefined) {
             if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
             const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
@@ -6604,14 +6704,38 @@ export class AgentFramework {
               tail_tokens: 'tailTokens',
               transition_pace_tokens: 'transitionPaceTokens',
             };
-            keys = input.settings.map((name) => {
-              if (typeof name !== 'string' || !names[name]) {
-                throw new Error(`Unknown reset setting: ${String(name)}`);
+            keys = [];
+            for (const name of input.settings) {
+              if (typeof name === 'string' && names[name]) {
+                keys.push(names[name]);
+                continue;
               }
-              return names[name];
-            });
+              const owner = [...extensions.values()].find(
+                (ext) => typeof name === 'string' && ext.keys.includes(name),
+              );
+              if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
+              const list = extResetKeys.get(owner) ?? [];
+              list.push(name as string);
+              extResetKeys.set(owner, list);
+            }
+            if (keys.length === 0) keys = undefined;
           }
-          result = { success: true, data: this.resetAgentRuntimeSettings(agentName, keys) };
+          const extResults: Record<string, unknown> = {};
+          if (input.settings === undefined) {
+            // Reset-all covers extensions too.
+            for (const ext of extensions.values()) {
+              if (ext.reset) Object.assign(extResults, ext.reset(agentName));
+            }
+          } else {
+            for (const [ext, list] of extResetKeys) {
+              if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
+            }
+          }
+          const coreTouched = input.settings === undefined || keys !== undefined;
+          const core = coreTouched
+            ? this.resetAgentRuntimeSettings(agentName, keys)
+            : this.getAgentRuntimeSettings(agentName);
+          result = { success: true, data: { ...core, ...extGet(), ...extResults } };
           break;
         }
         default:
