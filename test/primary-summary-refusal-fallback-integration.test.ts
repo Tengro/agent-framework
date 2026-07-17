@@ -264,6 +264,7 @@ async function createFrameworkFixture(options?: {
   agentName?: string;
   modules?: Module[];
   extraAgents?: Array<{ name: string; strategy: ProbeStrategy }>;
+  maxStreamTokens?: number;
 }): Promise<{
   path: string;
   framework: AgentFramework;
@@ -289,6 +290,7 @@ async function createFrameworkFixture(options?: {
       model: 'test-model',
       systemPrompt: 'system',
       strategy,
+      ...(options?.maxStreamTokens !== undefined ? { maxStreamTokens: options.maxStreamTokens } : {}),
       refusalHandling: {
         primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 100_000 },
       },
@@ -600,6 +602,60 @@ describe('primary summary refusal fallback integration', () => {
       }
       assert.equal(jsonContains(messages, TOOL_ARG_SENTINEL), true, 'canonical Chronicle output still carries the lived tool input');
       assert.equal(jsonContains(messages, TOOL_RESULT_SENTINEL), true, 'canonical Chronicle output still carries the lived tool result');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('holds a fallback retry instead of queueing a context-budget restart after a tool result', async () => {
+    let frameworkRef: AgentFramework | null = null;
+    const module = new EchoModule(() =>
+      jsonContains(primarySummaryQuarantineState(frameworkRef!, 'assistant'), 'L1-B'),
+    );
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [toolRoundResponse()],
+    ]);
+    const { framework, agent, strategy } = await createFrameworkFixture({
+      membrane,
+      modules: [module],
+      maxStreamTokens: 5,
+    });
+    frameworkRef = framework;
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'budget-restart-repro');
+
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 2, 'fallback tool-result over-budget must not trigger a third provider call');
+      assert.equal(module.calls.length, 1, 'tool must execute exactly once');
+      assert.deepEqual(module.quarantineObserved, [true], 'tool dispatch still runs against durable quarantine state');
+
+      const queuedRequests = (framework as unknown as {
+        pendingRequests: Array<{ reason?: string }>;
+      }).pendingRequests;
+      assert.equal(
+        queuedRequests.filter((request) => request.reason === 'context_budget_restart').length,
+        0,
+        'no context_budget_restart may remain queued for the held fallback family',
+      );
+
+      const records = fallbackRecords(framework);
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.finalStatus, 'held');
+      assert.equal(original.fallbackStatus, 'held');
+      assert.equal(original.fallbackHeldReason, 'primary_summary_fallback_context_budget_restart_required');
+      assert.equal(retry.finalStatus, 'held');
+      assert.equal(retry.fallbackHeldReason, 'primary_summary_fallback_context_budget_restart_required');
+      assert.equal(fallbackRetryRecords(framework).length, 1, 'the held retry family must remain singular');
     } finally {
       await framework.stop();
     }
