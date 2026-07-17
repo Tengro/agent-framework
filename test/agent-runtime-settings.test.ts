@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
 
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
@@ -201,6 +202,56 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
     );
   } finally {
     await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('fails closed on an invalid persisted same_round_think_text_policy override before any provider call', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-invalid-persisted-'));
+  const storePath = join(dir, 'store');
+  const store = JsStore.openOrCreate({ path: storePath });
+  try {
+    store.registerState({ id: 'framework/state', strategy: 'snapshot' });
+  } catch {
+    // Already registered.
+  }
+  store.setStateJson('framework/state', {
+    agentRuntimeSettings: {
+      agent: {
+        sameRoundThinkTextPolicy: 'bogus',
+      },
+    },
+  });
+  store.close();
+
+  let providerCalls = 0;
+  const rejectingMembrane = {
+    complete: async () => {
+      providerCalls++;
+      throw new Error('provider should not be called');
+    },
+    streamYielding: () => {
+      providerCalls++;
+      throw new Error('provider should not be called');
+    },
+  } as unknown as import('@animalabs/membrane').Membrane;
+
+  try {
+    await assert.rejects(
+      () => AgentFramework.create({
+        storePath,
+        membrane: rejectingMembrane,
+        agents: [{
+          name: 'agent',
+          model: 'test-model',
+          systemPrompt: 'test',
+        }],
+        modules: [],
+      }),
+      /Invalid persisted sameRoundThinkTextPolicy/,
+    );
+    assert.equal(providerCalls, 0);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

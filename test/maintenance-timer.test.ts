@@ -29,6 +29,7 @@ class QueuedStrategy implements ContextStrategy {
   readonly name = 'queued-test';
   ticks = 0;
   toolCounts: number[] = [];
+  thinkDescriptions: string[] = [];
 
   checkReadiness(): ReadinessState {
     return { ready: this.ticks >= 2, description: 'test maintenance queued' };
@@ -36,6 +37,8 @@ class QueuedStrategy implements ContextStrategy {
 
   async tick(ctx: StrategyContext): Promise<void> {
     this.toolCounts.push(ctx.tools?.length ?? 0);
+    const think = ctx.tools?.find((tool) => tool.name === 'think');
+    if (think) this.thinkDescriptions.push(think.description);
     this.ticks++;
   }
 
@@ -163,6 +166,52 @@ describe('queued context maintenance timer', () => {
       framework.start();
       await new Promise(resolve => setTimeout(resolve, 40));
       assert.equal(strategy.ticks, 0);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('passes a policy-correct dynamic think definition into queued maintenance', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-think-'));
+    const strategy = new QueuedStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{
+        name: 'agent',
+        model: 'test-model',
+        systemPrompt: 'test',
+        strategy,
+        sameRoundThinkTextPolicy: 'private',
+        allowedTools: 'all',
+      }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    (framework as unknown as {
+      channelRegistry: { getChannelTools: () => ToolDefinition[]; stopAll: () => void };
+    }).channelRegistry = {
+      getChannelTools: () => [
+        {
+          name: 'think',
+          description: 'static channel think',
+          inputSchema: { type: 'object', properties: { content: { type: 'string' } }, required: [] },
+        },
+      ],
+      stopAll: () => {},
+    };
+
+    try {
+      framework.start();
+      await waitFor(() => strategy.thinkDescriptions.length >= 2);
+      assert.ok(
+        strategy.thinkDescriptions.every((description) => description.includes('withheld from channel routing')),
+      );
+      assert.ok(
+        strategy.thinkDescriptions.every((description) => description !== 'static channel think'),
+      );
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

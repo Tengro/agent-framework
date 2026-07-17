@@ -48,6 +48,7 @@ import type {
   AgentRuntimeSettingsOverrides,
   AgentRuntimeSettingsSnapshot,
   AgentSettingsExtension,
+  SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
@@ -137,6 +138,10 @@ interface TurnCheckpoint {
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
+}
+
+interface InferenceToolSnapshot {
+  sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
 }
 
 /**
@@ -1140,8 +1145,15 @@ export class AgentFramework {
     return result;
   }
 
-  private buildThinkTool(agentName: string): import('./types/index.js').ToolDefinition {
-    const policy = this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy;
+  private captureInferenceToolSnapshot(agent: Agent): InferenceToolSnapshot {
+    return {
+      sameRoundThinkTextPolicy: agent.getEffectiveSameRoundThinkTextPolicy(),
+    };
+  }
+
+  private buildThinkTool(
+    policy: SameRoundThinkTextPolicy,
+  ): import('./types/index.js').ToolDefinition {
     return {
       name: 'think',
       description:
@@ -1204,9 +1216,17 @@ export class AgentFramework {
     };
   }
 
-  private getToolsForAgent(agentName: string): import('./types/index.js').ToolDefinition[] {
+  private getToolsForAgent(
+    agentName: string,
+    snapshot?: InferenceToolSnapshot,
+  ): import('./types/index.js').ToolDefinition[] {
     return this.getAllTools().map((tool) => {
-      if (tool.name === 'think') return this.buildThinkTool(agentName);
+      if (tool.name === 'think') {
+        return this.buildThinkTool(
+          snapshot?.sameRoundThinkTextPolicy
+            ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
+        );
+      }
       return tool;
     });
   }
@@ -1456,6 +1476,22 @@ export class AgentFramework {
     } catch {
       return null;
     }
+  }
+
+  private validatePersistedAgentRuntimeSettings(
+    agentName: string,
+    overrides: AgentRuntimeSettingsOverrides,
+  ): AgentRuntimeSettingsOverrides {
+    if (
+      overrides.sameRoundThinkTextPolicy !== undefined &&
+      overrides.sameRoundThinkTextPolicy !== 'public' &&
+      overrides.sameRoundThinkTextPolicy !== 'private'
+    ) {
+      throw new Error(
+        `Invalid persisted sameRoundThinkTextPolicy for agent "${agentName}": ${JSON.stringify(overrides.sameRoundThinkTextPolicy)}`,
+      );
+    }
+    return overrides;
   }
 
   private persistAgentRuntimeSettings(
@@ -2970,7 +3006,11 @@ export class AgentFramework {
 
     const agent = new Agent(config, contextManager, this.membrane);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
-    if (restoredSettings) agent.restoreRuntimeSettings(restoredSettings);
+    if (restoredSettings) {
+      agent.restoreRuntimeSettings(
+        this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
+      );
+    }
     this.agents.set(config.name, agent);
     this.agentConfigs.set(config.name, config);
 
@@ -3884,7 +3924,8 @@ export class AgentFramework {
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
     try {
-      const allTools = this.getToolsForAgent(agent.name);
+      const requestSnapshot = this.captureInferenceToolSnapshot(agent);
+      const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
       const tools = allTools.filter((t) => agent.canUseTool(t.name));
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
@@ -3926,7 +3967,14 @@ export class AgentFramework {
 
       const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
 
-      const handle = this.driveStream(agent, stream, trigger, attempt, compiledRequest);
+      const handle = this.driveStream(
+        agent,
+        stream,
+        requestSnapshot,
+        trigger,
+        attempt,
+        compiledRequest,
+      );
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -3972,6 +4020,7 @@ export class AgentFramework {
   private async driveStream(
     agent: Agent,
     stream: YieldingStream,
+    requestSnapshot: InferenceToolSnapshot,
     trigger?: InferenceRequest,
     attempt = 0,
     compiledRequest?: NormalizedRequest
@@ -4146,8 +4195,8 @@ export class AgentFramework {
             if (this.channelRegistry) {
               const roundToolNames = event.calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
-                roundToolNames.some((n) => bareToolName(n) === 'think') &&
-                agent.getEffectiveSameRoundThinkTextPolicy() === 'private';
+                roundToolNames.includes('think') &&
+                requestSnapshot.sameRoundThinkTextPolicy === 'private';
               if (roundToolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)))) {
                 turnSilenced = true;
               }
@@ -6936,7 +6985,20 @@ export class AgentFramework {
           const core = coreTouched
             ? this.updateAgentRuntimeSettings(agentName, patch)
             : this.getAgentRuntimeSettings(agentName);
-          result = { success: true, data: { ...core, ...extGet(), ...extResults } };
+          result = {
+            success: true,
+            data: {
+              ...core,
+              ...extGet(),
+              ...extResults,
+              ...(patch.sameRoundThinkTextPolicy !== undefined
+                ? {
+                    sameRoundThinkTextPolicyUpdateNote:
+                      'Stored now; applies to provider think routing and description beginning with the next inference.',
+                  }
+                : {}),
+            },
+          };
           break;
         }
         case 'reset': {
