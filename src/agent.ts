@@ -1,10 +1,19 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { createHash } from 'node:crypto';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
+
+export interface ActivationCompileArtifacts {
+  compileResult: CompileResult;
+  contract: PrimarySummaryContract & {
+    systemHash: string;
+  };
+}
 
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  artifacts: ActivationCompileArtifacts;
 }
 import type {
   ContextManager,
@@ -13,6 +22,9 @@ import type {
   CompileResult,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  PrimarySummaryContract,
+  PrimarySummaryIdentity,
+  PrimarySummaryProjection,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -32,6 +44,10 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentRuntimeSettingsOverrides,
 } from './types/index.js';
+
+type PrimarySummaryContractWithSystemHash = PrimarySummaryContract & {
+  systemHash: string;
+};
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
@@ -198,6 +214,141 @@ export class Agent {
     return manager.updateHotContextSettings(update);
   }
 
+  private hashJson(value: unknown): string {
+    return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+  }
+
+  private primarySummaryFallbackEnabled(): boolean {
+    return this.refusalHandling?.primarySummaryFallback?.enabled === true;
+  }
+
+  private buildPrimarySummaryContractForRequest(request: NormalizedRequest): PrimarySummaryContractWithSystemHash {
+    return {
+      systemHash: this.hashJson(request.system ?? ''),
+      modelConfigHash: this.hashJson({
+        requestConfig: request.config,
+        providerParams: request.providerParams,
+        promptCaching: request.promptCaching,
+        cacheTtl: request.cacheTtl,
+        assistantParticipant: request.assistantParticipant,
+      }),
+      toolContractHash: this.hashJson(request.tools ?? []),
+    };
+  }
+
+  private setPrimaryLaneContract(contract: PrimarySummaryContract | undefined): void {
+    const manager = this.contextManager as ContextManager & {
+      setPrimaryLaneContract?: (value: PrimarySummaryContract | undefined) => void;
+    };
+    manager.setPrimaryLaneContract?.(contract);
+  }
+
+  private matchingPrimarySummaryQuarantine(
+    projection: PrimarySummaryProjection,
+    contract: PrimarySummaryContract,
+  ): PrimarySummaryIdentity[] {
+    const manager = this.contextManager as ContextManager & {
+      matchingPrimarySummaryQuarantine?: (
+        projection: PrimarySummaryProjection,
+        contract?: PrimarySummaryContract,
+      ) => PrimarySummaryIdentity[];
+    };
+    return manager.matchingPrimarySummaryQuarantine?.(projection, contract) ?? [];
+  }
+
+  private expandPrimarySummaryProjectionRaw(
+    compiled: CompileResult,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+  ): CompileResult {
+    const manager = this.contextManager as ContextManager & {
+      expandPrimarySummaryProjectionRaw?: (
+        compiled: CompileResult,
+        summaries: ReadonlyArray<PrimarySummaryIdentity>,
+      ) => CompileResult;
+    };
+    if (typeof manager.expandPrimarySummaryProjectionRaw !== 'function') return compiled;
+    return manager.expandPrimarySummaryProjectionRaw(compiled, summaries);
+  }
+
+  private primarySummaryIdentityKey(identity: PrimarySummaryIdentity): string {
+    return [
+      identity.id,
+      identity.contentHash,
+      identity.carrierHash,
+      identity.sourceLeafHash,
+    ].join('\u0000');
+  }
+
+  private buildRequestFromCompileResult(
+    compileResult: CompileResult,
+    availableTools: ToolDefinition[],
+  ): NormalizedRequest {
+    let { messages, systemInjections } = compileResult;
+
+    messages = messages
+      .map((m) => ({
+        ...m,
+        content: m.content.filter(
+          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
+        ),
+      }))
+      .filter((m) => m.content.length > 0);
+
+    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+      messages = [...messages, {
+        participant: 'user',
+        content: [{ type: 'text', text: '[Continue]' }],
+      }];
+    }
+
+    return {
+      messages,
+      system: this.buildSystemPrompt(systemInjections),
+      config: {
+        model: this.model,
+        maxTokens: this.maxTokens,
+        ...(this.temperature !== undefined && { temperature: this.temperature }),
+        ...(this.thinking !== undefined && { thinking: this.thinking }),
+      },
+      tools: availableTools.length > 0 ? availableTools : undefined,
+      promptCaching: true,
+      cacheTtl: this.cacheTtl,
+      ...(this.providerParams && { providerParams: this.providerParams }),
+      assistantParticipant: this.name,
+    };
+  }
+
+  async prepareActivationRequest(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
+    budget?: TokenBudget,
+  ): Promise<{ request: NormalizedRequest; artifacts: ActivationCompileArtifacts }> {
+    (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
+      .setToolDefinitions?.(availableTools);
+
+    let compileResult = await this.compileWithInjections(budget, injections);
+    let request = this.buildRequestFromCompileResult(compileResult, availableTools);
+    const contract = this.buildPrimarySummaryContractForRequest(request);
+    this.setPrimaryLaneContract(contract);
+
+    const projection = compileResult.primarySummaryProjection;
+    if (this.primarySummaryFallbackEnabled() && projection) {
+      const quarantined = this.matchingPrimarySummaryQuarantine(projection, contract);
+      if (quarantined.length > 0) {
+        compileResult = this.expandPrimarySummaryProjectionRaw(compileResult, quarantined);
+        request = this.buildRequestFromCompileResult(compileResult, availableTools);
+      }
+    }
+
+    return {
+      request,
+      artifacts: {
+        compileResult,
+        contract,
+      },
+    };
+  }
+
   getRuntimeSettings(): AgentRuntimeSettingsSnapshot {
     const hot = this.getHotContextSettings();
     return {
@@ -242,6 +393,52 @@ export class Agent {
       return 'recipe';
     }
     return 'compatibility_default';
+  }
+
+  getCurrentBranchGeneration():
+    | { id: string; name: string; head: number; generation: number; parentId?: string; branchPoint?: number; created: Date }
+    | null {
+    const manager = this.contextManager as ContextManager & {
+      currentBranchGeneration?: () => {
+        id: string;
+        name: string;
+        head: number;
+        generation: number;
+        parentId?: string;
+        branchPoint?: number;
+        created: Date;
+      };
+    };
+    return manager.currentBranchGeneration?.() ?? null;
+  }
+
+  buildPrimarySummaryRawExpansionRequest(
+    artifacts: ActivationCompileArtifacts,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+    availableTools: ToolDefinition[],
+  ): { request: NormalizedRequest; artifacts: ActivationCompileArtifacts } {
+    this.setPrimaryLaneContract(artifacts.contract);
+    const alreadyExpanded = new Set(
+      artifacts.compileResult.primarySummaryProjection?.selectedSummaries
+        .filter((selection) => selection.renderedAs === 'raw_expansion')
+        .map((selection) => this.primarySummaryIdentityKey(selection.identity)) ?? [],
+    );
+    const expandable = summaries.filter((summary) =>
+      !alreadyExpanded.has(this.primarySummaryIdentityKey(summary)),
+    );
+    const compileResult = expandable.length > 0
+      ? this.expandPrimarySummaryProjectionRaw(
+          artifacts.compileResult,
+          expandable,
+        )
+      : artifacts.compileResult;
+    return {
+      request: this.buildRequestFromCompileResult(compileResult, availableTools),
+      artifacts: {
+        compileResult,
+        contract: artifacts.contract,
+      },
+    };
   }
 
   updateRuntimeSettings(patch: AgentRuntimeSettingsPatch): AgentRuntimeSettingsSnapshot {
@@ -585,64 +782,8 @@ export class Agent {
     injections?: ContextInjection[],
     budget?: TokenBudget
   ): Promise<NormalizedRequest> {
-    // Keep the context manager's view of the live tool surface current: the
-    // autobiographical strategy must declare the same tools on its
-    // summarizer/compression requests, or transcripts containing tool blocks
-    // are refused by Anthropic's reasoning_extraction classifier (labclaude
-    // incident, 2026-07-09). Optional chaining: older context-manager
-    // versions don't have the hook.
-    (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
-      .setToolDefinitions?.(availableTools);
-
-    let { messages, systemInjections } = await this.compileWithInjections(budget, injections);
-
-    // Sanitize: strip empty/whitespace text blocks and drop messages left with
-    // no content. The Anthropic API rejects empty text blocks with 400
-    // "messages: text content blocks must be non-empty"; when such a block
-    // reaches a live activation request the agent cannot complete ANY turn
-    // ([inference-failed] on every attempt) until the offending message ages
-    // out of the window. Empty text blocks occur naturally: tool-only turns,
-    // delivery-failure placeholders, silent/skip turns. Non-text blocks pass
-    // through unchanged, so tool pairing is unaffected. (Field-observed
-    // 2026-07-10 on a resident agent: one empty block muted the agent's live
-    // path entirely; twin of context-manager's stripEmptyTextBlocks on the
-    // compression path.)
-    messages = messages
-      .map((m) => ({
-        ...m,
-        content: m.content.filter(
-          // typeof guard is deliberate runtime defense: history loaded from
-          // disk can carry a non-string `text` despite what the types claim.
-          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
-        ),
-      }))
-      .filter((m) => m.content.length > 0);
-
-    // Safety: ensure messages don't end with an assistant message.
-    // Some models reject trailing assistant messages ("prefill not supported"),
-    // and after context compression a stale assistant turn can end up last.
-    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
-      messages = [...messages, {
-        participant: 'user',
-        content: [{ type: 'text', text: '[Continue]' }],
-      }];
-    }
-
-    return {
-      messages,
-      system: this.buildSystemPrompt(systemInjections),
-      config: {
-        model: this.model,
-        maxTokens: this.maxTokens,
-        ...(this.temperature !== undefined && { temperature: this.temperature }),
-        ...(this.thinking !== undefined && { thinking: this.thinking }),
-      },
-      tools: availableTools.length > 0 ? availableTools : undefined,
-      promptCaching: true,
-      cacheTtl: this.cacheTtl,
-      ...(this.providerParams && { providerParams: this.providerParams }),
-      assistantParticipant: this.name,
-    };
+    const { request } = await this.prepareActivationRequest(availableTools, injections, budget);
+    return request;
   }
 
   /**
@@ -662,7 +803,11 @@ export class Agent {
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget);
+    const { request, artifacts } = await this.prepareActivationRequest(
+      availableTools,
+      injections,
+      budget,
+    );
 
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
@@ -671,7 +816,27 @@ export class Agent {
     });
 
     this._state = { status: 'streaming', stream };
-    return { stream, request };
+    return { stream, request, artifacts };
+  }
+
+  startStreamFromRequest(
+    request: NormalizedRequest,
+    artifacts: ActivationCompileArtifacts,
+  ): StartStreamResult {
+    if (this._state.status !== 'streaming' && this._state.status !== 'idle') {
+      throw new Error(`Agent ${this.name} cannot replace stream in state ${this._state.status}`);
+    }
+    this._streamId++;
+    this._inferenceStartedAt = Date.now();
+    this.lastStreamInputTokens = 0;
+    this.setPrimaryLaneContract(artifacts.contract);
+    const stream = this.membrane.streamYielding(request, {
+      emitTokens: true,
+      emitBlocks: false,
+      emitUsage: true,
+    });
+    this._state = { status: 'streaming', stream };
+    return { stream, request, artifacts };
   }
 
   /**

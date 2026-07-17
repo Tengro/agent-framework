@@ -1,14 +1,19 @@
 import { join } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type {
+  BranchGenerationInfo,
   MessageId,
   MessageMetadata,
   MessageQuery,
   MessageQueryResult,
+  PrimarySummaryContract,
+  PrimarySummaryIdentity,
+  PrimarySummaryProjection,
   StoredMessage,
 } from '@animalabs/context-manager';
 import type {
@@ -51,7 +56,7 @@ import type {
   SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
-import { Agent } from './agent.js';
+import { Agent, type ActivationCompileArtifacts } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
@@ -121,6 +126,7 @@ const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
+const PRIMARY_SUMMARY_FALLBACK_STATE_ID = 'framework/primary-summary-fallback';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
@@ -173,6 +179,97 @@ interface RedoEntry {
 
 interface InferenceToolSnapshot {
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
+}
+
+type PrimarySummaryFallbackStatus =
+  | 'success'
+  | 'refusal'
+  | 'held'
+  | 'pending'
+  | 'error'
+  | 'timeout_unknown';
+
+interface PrimarySummaryFallbackRetryDispatch {
+  originalRequestId: string;
+  baselineRequestId: string;
+  intentId: string;
+  branch: { id: string; generation: number };
+  candidateSummaries: PrimarySummaryIdentity[];
+  originalArtifacts: ActivationCompileArtifacts;
+  originalProjectionKeys: string[];
+  expectedRetryRequestHash: string;
+  requestBudgetTokens: number;
+  originalRequestInputBoundTokens: number;
+  originalProviderInputTokens?: number;
+}
+
+interface PrimarySummaryFallbackIntentRecord {
+  intentId: string;
+  createdAt: number;
+  baselineRequestId: string;
+  candidateSummaries: PrimarySummaryIdentity[];
+  retryRequestHash: string;
+  retryCompleteBoundTokens: number;
+  requestBudgetTokens: number;
+  retryRequestId?: string;
+  dispatchedAt?: number;
+  quarantinePersistedAt?: number;
+  outputs?: PrimarySummaryFallbackOutputRecord[];
+  toolDispatches?: PrimarySummaryFallbackToolDispatchRecord[];
+  finalizedAt?: number;
+}
+
+interface PrimarySummaryFallbackOutputRecord {
+  phase: string;
+  contentHash: string;
+  messageId: string;
+  blockTypes: string[];
+  persistedAt: number;
+}
+
+interface PrimarySummaryFallbackToolDispatchRecord {
+  callId: string;
+  inputHash: string;
+  recordedAt: number;
+}
+
+interface PrimarySummaryRequestRecord {
+  requestId: string;
+  agentName: string;
+  namespace: string;
+  timestamp: number;
+  dispatchKind: 'primary' | 'primary_summary_fallback_retry';
+  branch: { id: string; name: string; generation: number };
+  projection: PrimarySummaryProjection | null;
+  requestInputBoundTokens: number;
+  requestCompleteBoundTokens: number;
+  providerInputTokens?: number;
+  systemHash: string;
+  modelConfigHash: string;
+  toolContractHash: string;
+  stopReason?: string;
+  visibleAssistantOutput: boolean;
+  executedToolCalls: number;
+  finalStatus: PrimarySummaryFallbackStatus;
+  fallbackIntent?: PrimarySummaryFallbackIntentRecord;
+  fallbackStatus?: PrimarySummaryFallbackStatus;
+  fallbackHeldReason?: string;
+}
+
+interface PrimarySummaryFallbackState {
+  requests: PrimarySummaryRequestRecord[];
+}
+
+interface ContextBudgetRestartDispatch {
+  requestId: string;
+  dispatchKind: 'primary' | 'primary_summary_fallback_retry';
+  originalRequestId?: string;
+  intentId?: string;
+}
+
+interface PendingInferenceRequest extends InferenceRequest {
+  primarySummaryFallbackRetry?: PrimarySummaryFallbackRetryDispatch;
+  contextBudgetRestart?: ContextBudgetRestartDispatch;
 }
 
 /**
@@ -322,6 +419,13 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
+interface ActiveStreamContext {
+  requestId: string;
+  trigger?: PendingInferenceRequest;
+  compiledRequest?: NormalizedRequest;
+  artifacts?: ActivationCompileArtifacts;
+}
+
 /** Cap an API error message for inline use in a rewind marker: keep enough to
  *  identify the failure class without pasting a wall of provider JSON into the
  *  agent's context. */
@@ -338,7 +442,7 @@ export class AgentFramework {
   private moduleRegistry: ModuleRegistry;
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
-  private pendingRequests: InferenceRequest[] = [];
+  private pendingRequests: PendingInferenceRequest[] = [];
   /**
    * Per-agent channel that triggered the agent's CURRENT inference turn, if any
    * (item-3 redux). Read by the ChannelRegistry's `activeChannelResolver` to
@@ -367,6 +471,8 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+  private activeStreamContexts: Map<string, ActiveStreamContext> = new Map();
+  private primarySummaryStateLock: Promise<void> = Promise.resolve();
 
   /** Per-agent output locus pinned for the CURRENT logical turn (see
    *  resolveTurnLocus in driveStream). Lives here — not in driveStream
@@ -622,6 +728,12 @@ export class AgentFramework {
       }
     }
 
+    try {
+      store.registerState({ id: PRIMARY_SUMMARY_FALLBACK_STATE_ID, strategy: 'snapshot' });
+    } catch {
+      // Already registered
+    }
+
     const discordAwarenessOutboxPath = config.discordAwarenessOutboxPath
       ?? (config.storePath ? defaultDiscordAwarenessOutboxPath(config.storePath) : undefined);
     const discordAwarenessOutbox = discordAwarenessOutboxPath
@@ -668,6 +780,7 @@ export class AgentFramework {
 
     // Restore persisted usage data (if any) from prior session
     framework.restoreUsageState();
+    await framework.reconcilePrimarySummaryFallbackStateOnStartup();
 
     // Create agents
     for (const agentConfig of config.agents) {
@@ -930,7 +1043,7 @@ export class AgentFramework {
     const queued = [...this.agents.values()].flatMap((agent) => {
       const cm = agent.getContextManager();
       const tools = this.getToolsForAgent(agent.name).filter((tool) => agent.canUseTool(tool.name));
-      cm.setToolDefinitions(tools);
+      cm.setToolDefinitions?.(tools);
       if (cm.isReady()) return [];
       const pending = cm.getPendingWork()?.description;
       const progress = this.contextProgress(cm);
@@ -1589,6 +1702,732 @@ export class AgentFramework {
       reject = rej;
     });
     return { promise, resolve, reject };
+  }
+
+  private hashJson(value: unknown): string {
+    return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+  }
+
+  private estimateStringTokens(text: string, overhead = 0): number {
+    return Math.ceil(Buffer.byteLength(text, 'utf8') / 4) + overhead;
+  }
+
+  private estimateUnknownTokens(value: unknown, overhead = 0): number {
+    return this.estimateStringTokens(JSON.stringify(value) ?? 'null', overhead);
+  }
+
+  private estimateRequestInputBoundTokens(request: NormalizedRequest): number {
+    let total = 96;
+    total += this.estimateStringTokens(request.system ?? '', 48);
+    for (const message of request.messages) {
+      total += 24;
+      total += this.estimateStringTokens(message.participant, 8);
+      if ((message as { cacheBreakpoint?: boolean }).cacheBreakpoint) total += 8;
+      for (const block of message.content) {
+        switch (block.type) {
+          case 'text':
+            total += this.estimateStringTokens(block.text, 24);
+            break;
+          case 'thinking':
+            total += this.estimateStringTokens(block.thinking, 32);
+            total += block.signature ? this.estimateStringTokens(block.signature, 8) : 0;
+            break;
+          case 'redacted_thinking':
+            total += this.estimateUnknownTokens(block, 32);
+            break;
+          default:
+            total += this.estimateUnknownTokens(block, 32);
+            break;
+        }
+      }
+    }
+    if (request.tools && request.tools.length > 0) {
+      total += 32;
+      for (const tool of request.tools) {
+        total += this.estimateUnknownTokens({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        }, 48);
+      }
+    }
+    total += this.estimateUnknownTokens(request.config, 48);
+    if (request.providerParams !== undefined) {
+      total += this.estimateUnknownTokens(request.providerParams, 32);
+    }
+    total += request.promptCaching ? 16 : 0;
+    total += request.cacheTtl ? this.estimateStringTokens(request.cacheTtl, 8) : 0;
+    total += request.assistantParticipant
+      ? this.estimateStringTokens(request.assistantParticipant, 8)
+      : 0;
+    return total;
+  }
+
+  private estimateRequestCompleteBoundTokens(request: NormalizedRequest): number {
+    const reserve = typeof request.config.maxTokens === 'number' && Number.isFinite(request.config.maxTokens)
+      ? request.config.maxTokens
+      : 0;
+    return this.estimateRequestInputBoundTokens(request) + reserve + 96;
+  }
+
+  private primarySummaryAdmissionBoundTokens(
+    originalRequestInputTokens: number,
+    expandedRequest: NormalizedRequest,
+    originalProviderInputTokens: number | undefined,
+  ): number {
+    const expandedInput = this.estimateRequestInputBoundTokens(expandedRequest);
+    const expandedComplete = this.estimateRequestCompleteBoundTokens(expandedRequest);
+    if (originalProviderInputTokens === undefined) return expandedComplete;
+    const reserve = typeof expandedRequest.config.maxTokens === 'number' && Number.isFinite(expandedRequest.config.maxTokens)
+      ? expandedRequest.config.maxTokens
+      : 0;
+    const positiveDelta = Math.max(0, expandedInput - originalRequestInputTokens);
+    return Math.max(
+      expandedComplete,
+      originalProviderInputTokens + positiveDelta + reserve + 96,
+    );
+  }
+
+  private readPrimarySummaryFallbackState(): PrimarySummaryFallbackState {
+    const raw = (this.store as { getStateJson?: (id: string) => unknown } | undefined)
+      ?.getStateJson?.(PRIMARY_SUMMARY_FALLBACK_STATE_ID);
+    if (!raw || typeof raw !== 'object') return { requests: [] };
+    const requests = Array.isArray((raw as { requests?: unknown[] }).requests)
+      ? ((raw as { requests: PrimarySummaryRequestRecord[] }).requests)
+      : [];
+    return { requests };
+  }
+
+  private writePrimarySummaryFallbackState(state: PrimarySummaryFallbackState): void {
+    this.store.setStateJson(PRIMARY_SUMMARY_FALLBACK_STATE_ID, state);
+  }
+
+  private async withPrimarySummaryStateLock<T>(work: () => Promise<T> | T): Promise<T> {
+    const previous = this.primarySummaryStateLock;
+    let release!: () => void;
+    this.primarySummaryStateLock = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
+
+  private async reconcilePrimarySummaryFallbackStateOnStartup(): Promise<void> {
+    const alerts: Array<{ agentName: string; requestId: string; reason: string }> = [];
+    await this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      let changed = false;
+      state.requests = state.requests.map((record) => {
+        if (record.dispatchKind === 'primary_summary_fallback_retry' && record.finalStatus === 'pending') {
+          changed = true;
+          const reason = 'primary_summary_fallback_unresolved_on_restart';
+          alerts.push({ agentName: record.agentName, requestId: record.requestId, reason });
+          return {
+            ...record,
+            finalStatus: 'held',
+            fallbackHeldReason: reason,
+          };
+        }
+        if (record.finalStatus === 'pending') {
+          changed = true;
+          const reason = 'primary_summary_request_unresolved_on_restart';
+          alerts.push({ agentName: record.agentName, requestId: record.requestId, reason });
+          return {
+            ...record,
+            finalStatus: 'timeout_unknown',
+            fallbackHeldReason: reason,
+          };
+        }
+        if (record.fallbackIntent && record.fallbackStatus === 'pending') {
+          changed = true;
+          const reason = 'primary_summary_fallback_unresolved_on_restart';
+          alerts.push({ agentName: record.agentName, requestId: record.requestId, reason });
+          return {
+            ...record,
+            fallbackStatus: 'held',
+            fallbackHeldReason: reason,
+          };
+        }
+        return record;
+      });
+      if (changed) this.writePrimarySummaryFallbackState({ requests: state.requests.slice(-256) });
+    });
+    for (const alert of alerts) {
+      this.opsAlert('refusal-held', alert.agentName, alert.reason, {
+        data: { requestId: alert.requestId },
+      });
+    }
+  }
+
+  private primarySummaryIdentityKey(identity: PrimarySummaryIdentity): string {
+    return [
+      identity.id,
+      identity.contentHash,
+      identity.carrierHash,
+      identity.sourceLeafHash,
+    ].join('\u0000');
+  }
+
+  private primarySummaryProjectionKeys(projection: PrimarySummaryProjection | null): string[] {
+    return projection?.selectedSummaries.map((selection) =>
+      this.primarySummaryIdentityKey(selection.identity),
+    ) ?? [];
+  }
+
+  private primarySummaryFallbackConfig(agent: Agent): {
+    enabled: boolean;
+    maxNewSummaries: number;
+    requestBudgetTokens: number;
+  } {
+    const raw = (agent.refusalHandling as {
+      primarySummaryFallback?: {
+        enabled?: boolean;
+        maxNewSummaries?: number;
+        requestBudgetTokens?: number;
+      };
+    } | undefined)?.primarySummaryFallback;
+    const fallbackBudgetBase = agent.contextBudgetTokens ?? 100_000;
+    return {
+      enabled: raw?.enabled === true,
+      maxNewSummaries:
+        typeof raw?.maxNewSummaries === 'number' && Number.isSafeInteger(raw.maxNewSummaries)
+          ? Math.max(0, raw.maxNewSummaries)
+          : 4,
+      requestBudgetTokens:
+        typeof raw?.requestBudgetTokens === 'number' && Number.isFinite(raw.requestBudgetTokens) && raw.requestBudgetTokens > 0
+          ? raw.requestBudgetTokens
+          : fallbackBudgetBase + agent.maxTokens,
+    };
+  }
+
+  private latestCompatibleHealthyPrimaryRequest(
+    current: PrimarySummaryRequestRecord,
+    state: PrimarySummaryFallbackState,
+  ): PrimarySummaryRequestRecord | null {
+    for (let i = state.requests.length - 1; i >= 0; i--) {
+      const candidate = state.requests[i]!;
+      if (candidate.requestId === current.requestId) continue;
+      if (candidate.agentName !== current.agentName) continue;
+      if (candidate.namespace !== current.namespace) continue;
+      if (candidate.branch.id !== current.branch.id) continue;
+      if (candidate.branch.generation !== current.branch.generation) continue;
+      if (candidate.systemHash !== current.systemHash) continue;
+      if (candidate.modelConfigHash !== current.modelConfigHash) continue;
+      if (candidate.toolContractHash !== current.toolContractHash) continue;
+      if (candidate.dispatchKind !== 'primary') continue;
+      if (candidate.fallbackIntent || candidate.fallbackStatus) continue;
+      if (candidate.finalStatus !== 'success') continue;
+      return candidate;
+    }
+    return null;
+  }
+
+  private async persistPrimarySummaryRequestRecord(record: PrimarySummaryRequestRecord): Promise<void> {
+    await this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      const requests = state.requests.filter((entry) => entry.requestId !== record.requestId);
+      requests.push(record);
+      this.writePrimarySummaryFallbackState({ requests: requests.slice(-256) });
+    });
+  }
+
+  private async updatePrimarySummaryRequestRecord(
+    requestId: string,
+    update: (record: PrimarySummaryRequestRecord) => PrimarySummaryRequestRecord,
+  ): Promise<PrimarySummaryRequestRecord | null> {
+    return this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      const index = state.requests.findIndex((entry) => entry.requestId === requestId);
+      if (index < 0) return null;
+      state.requests[index] = update(state.requests[index]!);
+      this.writePrimarySummaryFallbackState({ requests: state.requests.slice(-256) });
+      return state.requests[index]!;
+    });
+  }
+
+  private async getPrimarySummaryRequestRecord(requestId: string): Promise<PrimarySummaryRequestRecord | null> {
+    return this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      return state.requests.find((entry) => entry.requestId === requestId) ?? null;
+    });
+  }
+
+  private primarySummaryContractsMatch(
+    left: PrimarySummaryContract & { systemHash: string },
+    right: PrimarySummaryContract & { systemHash: string },
+  ): boolean {
+    return left.systemHash === right.systemHash
+      && left.modelConfigHash === right.modelConfigHash
+      && left.toolContractHash === right.toolContractHash;
+  }
+
+  private primarySummaryFallbackOutputPhaseHash(blocks: ReadonlyArray<ContentBlock>): string {
+    return this.hashJson(blocks);
+  }
+
+  private primarySummaryFallbackBlockTypes(blocks: ReadonlyArray<ContentBlock>): string[] {
+    return blocks.map((block) => block.type);
+  }
+
+  private summarizePrimarySummaryRetryRequest(request: NormalizedRequest): Record<string, unknown> {
+    const blockCounts = new Map<string, number>();
+    for (const message of request.messages) {
+      for (const block of message.content) {
+        blockCounts.set(block.type, (blockCounts.get(block.type) ?? 0) + 1);
+      }
+    }
+    return {
+      kind: 'primary_summary_fallback_retry',
+      requestHash: this.hashJson(request),
+      systemHash: this.hashJson(request.system ?? ''),
+      messageCount: request.messages.length,
+      toolCount: request.tools?.length ?? 0,
+      participantCount: [...new Set(request.messages.map((message) => message.participant))].length,
+      blockCounts: Object.fromEntries([...blockCounts.entries()].sort(([left], [right]) => left.localeCompare(right))),
+      promptCaching: request.promptCaching === true,
+      cacheTtl: request.cacheTtl,
+      assistantParticipant: request.assistantParticipant,
+      requestCompleteBoundTokens: this.estimateRequestCompleteBoundTokens(request),
+    };
+  }
+
+  private summarizePrimarySummaryRetryResponse(response: NormalizedResponse): Record<string, unknown> {
+    const blockCounts = new Map<string, number>();
+    for (const block of response.content) {
+      blockCounts.set(block.type, (blockCounts.get(block.type) ?? 0) + 1);
+    }
+    return {
+      kind: 'primary_summary_fallback_retry',
+      stopReason: response.stopReason,
+      rawAssistantTextHash: response.rawAssistantText
+        ? this.hashJson(response.rawAssistantText)
+        : undefined,
+      blockCounts: Object.fromEntries([...blockCounts.entries()].sort(([left], [right]) => left.localeCompare(right))),
+      toolCallIds: response.toolCalls.map((call: { id: string }) => call.id),
+      usage: response.usage
+        ? {
+            inputTokens: response.usage.inputTokens,
+            outputTokens: response.usage.outputTokens,
+          }
+        : undefined,
+    };
+  }
+
+  private async claimPrimarySummaryRetryIntent(
+    originalRequestId: string,
+    intentId: string,
+    retryRequestId: string,
+  ): Promise<'claimed' | 'duplicate' | 'missing'> {
+    let outcome: 'claimed' | 'duplicate' | 'missing' = 'missing';
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId || record.fallbackStatus !== 'pending') {
+        return record;
+      }
+      if (intent.retryRequestId && intent.retryRequestId !== retryRequestId) {
+        outcome = 'duplicate';
+        return record;
+      }
+      outcome = 'claimed';
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          retryRequestId,
+          dispatchedAt: intent.dispatchedAt ?? Date.now(),
+        },
+      };
+    });
+    return outcome;
+  }
+
+  private async validatePrimarySummaryRetryMutation(
+    agent: Agent,
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+    compiledRequest: NormalizedRequest,
+    artifacts: ActivationCompileArtifacts,
+    phase: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string; data: Record<string, unknown> }> {
+    const branch = agent.getCurrentBranchGeneration();
+    if (!branch || branch.id !== retryDispatch.branch.id || branch.generation !== retryDispatch.branch.generation) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_branch_changed_${phase}`,
+        data: {
+          expectedBranchId: retryDispatch.branch.id,
+          expectedGeneration: retryDispatch.branch.generation,
+          actualBranchId: branch?.id,
+          actualGeneration: branch?.generation,
+        },
+      };
+    }
+    const requestHash = this.hashJson(compiledRequest);
+    if (requestHash !== retryDispatch.expectedRetryRequestHash) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_request_changed_${phase}`,
+        data: {
+          expectedRetryRequestHash: retryDispatch.expectedRetryRequestHash,
+          actualRetryRequestHash: requestHash,
+        },
+      };
+    }
+    if (
+      this.primarySummaryProjectionKeys(artifacts.compileResult.primarySummaryProjection ?? null).join('\u0000') !==
+      retryDispatch.originalProjectionKeys.join('\u0000')
+    ) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_projection_changed_${phase}`,
+        data: {
+          expectedProjectionKeys: retryDispatch.originalProjectionKeys,
+          actualProjectionKeys: this.primarySummaryProjectionKeys(
+            artifacts.compileResult.primarySummaryProjection ?? null,
+          ),
+        },
+      };
+    }
+    if (!this.primarySummaryContractsMatch(artifacts.contract, retryDispatch.originalArtifacts.contract)) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_contract_changed_${phase}`,
+        data: {
+          expectedContract: retryDispatch.originalArtifacts.contract,
+          actualContract: artifacts.contract,
+        },
+      };
+    }
+    const original = await this.getPrimarySummaryRequestRecord(retryDispatch.originalRequestId);
+    if (
+      !original?.fallbackIntent ||
+      original.fallbackIntent.intentId !== retryDispatch.intentId ||
+      original.fallbackIntent.retryRequestId !== requestId ||
+      original.fallbackStatus !== 'pending'
+    ) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_intent_changed_${phase}`,
+        data: {
+          expectedIntentId: retryDispatch.intentId,
+          actualIntentId: original?.fallbackIntent?.intentId,
+          retryRequestId: original?.fallbackIntent?.retryRequestId,
+          fallbackStatus: original?.fallbackStatus,
+        },
+      };
+    }
+    return { ok: true };
+  }
+
+  private async recordPrimarySummaryRetryQuarantine(
+    originalRequestId: string,
+    intentId: string,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId || intent.quarantinePersistedAt) return record;
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          quarantinePersistedAt: Date.now(),
+        },
+      };
+    });
+  }
+
+  private async recordPrimarySummaryRetryOutput(
+    originalRequestId: string,
+    intentId: string,
+    output: PrimarySummaryFallbackOutputRecord,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId) return record;
+      const existing = intent.outputs?.find((entry) => entry.phase === output.phase);
+      if (
+        existing &&
+        existing.contentHash === output.contentHash &&
+        existing.messageId === output.messageId
+      ) {
+        return record;
+      }
+      if (existing) {
+        throw new Error(`Primary summary fallback output phase '${output.phase}' changed after persistence`);
+      }
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          outputs: [...(intent.outputs ?? []), output],
+        },
+      };
+    });
+  }
+
+  private async recordPrimarySummaryRetryToolDispatch(
+    originalRequestId: string,
+    intentId: string,
+    call: ToolCall,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId) return record;
+      const inputHash = this.hashJson(call.input);
+      const existing = intent.toolDispatches?.find((entry) => entry.callId === call.id);
+      if (existing?.inputHash === inputHash) return record;
+      if (existing) {
+        throw new Error(`Primary summary fallback tool dispatch '${call.id}' changed after persistence`);
+      }
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          toolDispatches: [
+            ...(intent.toolDispatches ?? []),
+            {
+              callId: call.id,
+              inputHash,
+              recordedAt: Date.now(),
+            },
+          ],
+        },
+      };
+    });
+  }
+
+  private async resolveContextBudgetRestartDispatch(
+    requestId: string,
+    retryDispatch?: PrimarySummaryFallbackRetryDispatch,
+  ): Promise<ContextBudgetRestartDispatch> {
+    const retryIdentity = retryDispatch
+      ? {
+          requestId,
+          dispatchKind: 'primary_summary_fallback_retry' as const,
+          originalRequestId: retryDispatch.originalRequestId,
+          intentId: retryDispatch.intentId,
+        }
+      : null;
+    const record = await this.getPrimarySummaryRequestRecord(requestId);
+    if (record?.dispatchKind === 'primary_summary_fallback_retry' && retryIdentity) {
+      return retryIdentity;
+    }
+    if (retryIdentity) {
+      const original = await this.getPrimarySummaryRequestRecord(retryIdentity.originalRequestId);
+      if (
+        original?.fallbackIntent?.intentId === retryIdentity.intentId
+        && original.fallbackIntent.retryRequestId === requestId
+      ) {
+        return retryIdentity;
+      }
+    }
+    return {
+      requestId,
+      dispatchKind: 'primary',
+    };
+  }
+
+  private contextBudgetRestartMatchesIdentity(
+    request: PendingInferenceRequest,
+    identity: ContextBudgetRestartDispatch,
+  ): boolean {
+    if (request.reason !== 'context_budget_restart') return false;
+    const restart = request.contextBudgetRestart;
+    if (!restart) return false;
+    if (restart.dispatchKind !== identity.dispatchKind) return false;
+    if (restart.requestId !== identity.requestId) return false;
+    if (identity.dispatchKind !== 'primary_summary_fallback_retry') return true;
+    return restart.originalRequestId === identity.originalRequestId
+      && restart.intentId === identity.intentId;
+  }
+
+  private clearQueuedContextBudgetRestart(identity: ContextBudgetRestartDispatch): number {
+    const before = this.pendingRequests.length;
+    this.pendingRequests = this.pendingRequests.filter(
+      (request) => !this.contextBudgetRestartMatchesIdentity(request, identity),
+    );
+    return before - this.pendingRequests.length;
+  }
+
+  private async markPrimarySummaryRetrySuccess(
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+    stopReason: string | undefined,
+    providerInputTokens: number | undefined,
+    visibleAssistantOutput: boolean,
+    executedToolCalls: number,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      stopReason,
+      providerInputTokens,
+      visibleAssistantOutput,
+      executedToolCalls,
+      finalStatus: 'success',
+      fallbackHeldReason: undefined,
+    }));
+    await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      return {
+        ...record,
+        finalStatus: 'success',
+        fallbackStatus: 'success',
+        fallbackHeldReason: undefined,
+        fallbackIntent: intent && intent.intentId === retryDispatch.intentId
+          ? { ...intent, finalizedAt: Date.now() }
+          : intent,
+      };
+    });
+  }
+
+  private async holdPrimarySummaryRetryFamily(
+    agent: Agent,
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+    reason: string,
+    data?: Record<string, unknown>,
+    options?: { emitChronicleMarker?: boolean; stopReason?: string },
+  ): Promise<void> {
+    const clearedQueuedContextBudgetRestarts = this.clearQueuedContextBudgetRestart({
+      requestId,
+      dispatchKind: 'primary_summary_fallback_retry',
+      originalRequestId: retryDispatch.originalRequestId,
+      intentId: retryDispatch.intentId,
+    });
+    const holdData = clearedQueuedContextBudgetRestarts > 0
+      ? { ...(data ?? {}), clearedQueuedContextBudgetRestarts }
+      : data;
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      ...(options?.stopReason ? { stopReason: options.stopReason } : {}),
+      finalStatus: 'held',
+      fallbackHeldReason: reason,
+    }));
+    await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => ({
+      ...record,
+      finalStatus: 'held',
+      fallbackStatus: 'held',
+      fallbackHeldReason: reason,
+    }));
+    this.opsAlert('refusal-held', agent.name, reason, { data: holdData });
+    if (options?.emitChronicleMarker === false) return;
+    try {
+      agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text:
+            `[refusal-held] Your previous turn was refused by the provider and ` +
+            `is being held for operator review rather than silently retried. ` +
+            `Automatic raw-expansion recovery was either unsafe or unsuccessful.`,
+        }],
+        { system: true, kind: 'refusal-held', reason },
+      );
+    } catch (error) {
+      console.error('[refusal-held] could not record chronicle marker:', error);
+    }
+  }
+
+  private async primarySummaryRetryAlreadySucceeded(
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+  ): Promise<boolean> {
+    const [retryRecord, originalRecord] = await Promise.all([
+      this.getPrimarySummaryRequestRecord(requestId),
+      this.getPrimarySummaryRequestRecord(retryDispatch.originalRequestId),
+    ]);
+    return retryRecord?.finalStatus === 'success'
+      || originalRecord?.fallbackStatus === 'success'
+      || originalRecord?.finalStatus === 'success';
+  }
+
+  private async primarySummaryRetryFamilyAlreadySettled(
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+  ): Promise<boolean> {
+    const [retryRecord, originalRecord] = await Promise.all([
+      this.getPrimarySummaryRequestRecord(requestId),
+      this.getPrimarySummaryRequestRecord(retryDispatch.originalRequestId),
+    ]);
+    return retryRecord?.finalStatus === 'held'
+      || retryRecord?.finalStatus === 'success'
+      || originalRecord?.fallbackStatus === 'held'
+      || originalRecord?.fallbackStatus === 'success'
+      || originalRecord?.finalStatus === 'held'
+      || originalRecord?.finalStatus === 'success';
+  }
+
+  private async holdPrimarySummaryRequest(
+    agent: Agent,
+    requestId: string,
+    reason: string,
+    data?: Record<string, unknown>,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      finalStatus: 'held',
+      fallbackStatus: 'held',
+      fallbackHeldReason: reason,
+    }));
+    this.opsAlert('refusal-held', agent.name, reason, { data });
+    try {
+      agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text:
+            `[refusal-held] Your previous turn was refused by the provider and ` +
+            `is being held for operator review rather than silently retried. ` +
+            `Automatic raw-expansion recovery was either unsafe or unsuccessful.`,
+        }],
+        { system: true, kind: 'refusal-held', reason },
+      );
+    } catch (error) {
+      console.error('[refusal-held] could not record chronicle marker:', error);
+    }
+  }
+
+  private hasVisibleAssistantOutput(blocks: ReadonlyArray<ContentBlock>): boolean {
+    return blocks.some((block) => block.type !== 'thinking' && block.type !== 'redacted_thinking');
+  }
+
+  private buildPrimarySummaryRequestRecord(
+    agent: Agent,
+    requestId: string,
+    dispatchKind: PrimarySummaryRequestRecord['dispatchKind'],
+    request: NormalizedRequest,
+    artifacts: ActivationCompileArtifacts | undefined,
+    branch: BranchGenerationInfo | null,
+    stopReason: string | undefined,
+    visibleAssistantOutput: boolean,
+    executedToolCalls: number,
+    providerInputTokens: number | undefined,
+    finalStatus: PrimarySummaryFallbackStatus,
+  ): PrimarySummaryRequestRecord {
+    const projection = artifacts?.compileResult.primarySummaryProjection ?? null;
+    return {
+      requestId,
+      agentName: agent.name,
+      namespace: projection?.namespace ?? `agents/${agent.name}`,
+      timestamp: Date.now(),
+      dispatchKind,
+      branch: branch
+        ? { id: branch.id, name: branch.name, generation: branch.generation }
+        : { id: 'unknown', name: 'unknown', generation: -1 },
+      projection,
+      requestInputBoundTokens: this.estimateRequestInputBoundTokens(request),
+      requestCompleteBoundTokens: this.estimateRequestCompleteBoundTokens(request),
+      providerInputTokens,
+      systemHash: artifacts?.contract.systemHash ?? this.hashJson(request.system ?? ''),
+      modelConfigHash: artifacts?.contract.modelConfigHash ?? this.hashJson({ request: request.config }),
+      toolContractHash: artifacts?.contract.toolContractHash ?? this.hashJson(request.tools ?? []),
+      stopReason,
+      visibleAssistantOutput,
+      executedToolCalls,
+      finalStatus,
+    };
   }
 
   /** Liveness ping for an active ephemeral run (no-op otherwise). */
@@ -3137,6 +3976,7 @@ export class AgentFramework {
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
         if (currentState.status === 'ready') {
+          const activeStreamContext = this.activeStreamContexts.get(agent.name);
           // Flush pending assistant blocks (tool_use + preamble text) to context
           const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
           if (pendingBlocks) {
@@ -3258,6 +4098,59 @@ export class AgentFramework {
             // a terminal failure — rejecting an ephemeral's promise mid-run
             // and emitting a spurious inference:exhausted (same race shape as
             // endTurn above).
+            const requestId = activeStreamContext?.requestId;
+            const primarySummaryRetry = activeStreamContext?.trigger?.primarySummaryFallbackRetry;
+            const compiledRequest = activeStreamContext?.compiledRequest;
+            const artifacts = activeStreamContext?.artifacts;
+            const restartDispatch = await this.resolveContextBudgetRestartDispatch(
+              requestId ?? `${agent.name}:context_budget_restart`,
+              primarySummaryRetry,
+            );
+            if (
+              restartDispatch.dispatchKind === 'primary_summary_fallback_retry'
+              && requestId
+              && primarySummaryRetry
+              && compiledRequest
+              && artifacts
+            ) {
+              const validation = await this.validatePrimarySummaryRetryMutation(
+                agent,
+                requestId,
+                primarySummaryRetry,
+                compiledRequest,
+                artifacts,
+                'before_context_budget_restart_hold',
+              );
+              if (!validation.ok) {
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  validation.reason,
+                  validation.data,
+                  { emitChronicleMarker: false, stopReason: 'abort' },
+                );
+              } else {
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  'primary_summary_fallback_context_budget_restart_required',
+                  {
+                    inputTokens: agent.lastStreamInputTokens,
+                    budget: agent.maxStreamTokens,
+                    originalRequestId: primarySummaryRetry.originalRequestId,
+                    intentId: primarySummaryRetry.intentId,
+                  },
+                  { emitChronicleMarker: false, stopReason: 'abort' },
+                );
+              }
+              this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
+              currentState.stream?.cancel();
+              agent.reset();
+              this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+              return;
+            }
             if (currentState.stream) {
               this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
             }
@@ -3274,6 +4167,8 @@ export class AgentFramework {
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
+              channelId: activeStreamContext?.trigger?.channelId,
+              contextBudgetRestart: restartDispatch,
             });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream.
@@ -3860,7 +4755,7 @@ export class AgentFramework {
     const state = this.createFrameworkState();
 
     // Group requests by agent
-    const requestsByAgent = new Map<string, InferenceRequest[]>();
+    const requestsByAgent = new Map<string, PendingInferenceRequest[]>();
     for (const req of this.pendingRequests) {
       const existing = requestsByAgent.get(req.agentName) ?? [];
       existing.push(req);
@@ -3871,7 +4766,8 @@ export class AgentFramework {
     this.pendingRequests = [];
 
     // Check each agent
-    for (const [agentName, requests] of requestsByAgent) {
+    for (const [agentName, queuedRequests] of requestsByAgent) {
+      let requests = queuedRequests;
       const agent = this.agents.get(agentName);
       if (!agent) {
         // Agent not found — request is orphaned. Emit warning and drop.
@@ -3916,6 +4812,14 @@ export class AgentFramework {
         continue;
       }
 
+      requests = requests.filter((request) =>
+        request.reason !== 'context_budget_restart'
+        || request.contextBudgetRestart?.dispatchKind !== 'primary_summary_fallback_retry'
+      );
+      if (requests.length === 0) {
+        continue;
+      }
+
       // Check policy
       if (!this.inferencePolicy.shouldInfer(agentName, requests, state)) {
         // Loud drop: a queued request that dies here is otherwise invisible —
@@ -3929,7 +4833,12 @@ export class AgentFramework {
       }
 
       // Start streaming inference (non-blocking — driveStream runs in background)
-      const trigger = requests[0];
+      const trigger = requests.find((request) => request.primarySummaryFallbackRetry) ?? requests[0]!;
+      if (trigger.primarySummaryFallbackRetry) {
+        for (const request of requests) {
+          if (request !== trigger) this.pendingRequests.push(request);
+        }
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle) — reply
@@ -3946,9 +4855,9 @@ export class AgentFramework {
     }
   }
 
-  private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
+  private async startAgentStream(agent: Agent, trigger?: PendingInferenceRequest, attempt = 0): Promise<void> {
     // Record turn checkpoint before inference (only on first attempt, not retries)
-    if (attempt === 0) {
+    if (attempt === 0 && trigger?.reason !== 'primary-summary-fallback-retry') {
       this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
@@ -3969,62 +4878,276 @@ export class AgentFramework {
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
     this.eventGate?.onInferenceStarted(agent.name);
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
+    const requestId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
       const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
       const tools = allTools.filter((t) => agent.canUseTool(t.name));
+      const fallbackConfig = this.primarySummaryFallbackConfig(agent);
+      const retryDispatch = trigger?.primarySummaryFallbackRetry;
+      let compiledRequest: NormalizedRequest;
+      let artifacts: ActivationCompileArtifacts;
+      let branch = agent.getCurrentBranchGeneration();
 
-      // Gather context from modules (pull-based) and MCPL hooks (push-based)
-      // Both produce ContextInjection[] that get merged before inference.
-      let injections: ContextInjection[] | undefined;
-
-      // Module gatherContext (fail-open, per-module timeout — the module's
-      // contextTimeoutMs, else the registry default). Injections are
-      // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
-      // injections below, so conversation forks don't see cross-channel
-      // content.
-      try {
-        const moduleInjections = this.scopeInjectionsForAgent(
-          agent.name,
-          await this.moduleRegistry.gatherContext(agent.name),
-        );
-        if (moduleInjections.length > 0) {
-          injections = moduleInjections;
-        }
-      } catch (error) {
-        console.error('Module gatherContext error:', error);
-      }
-
-      // MCPL beforeInference hooks (fail-open)
-      if (this.hookOrchestrator) {
-        try {
-          const hookParams = this.buildBeforeInferenceParams(agent, trigger);
-          const hookInjections = this.scopeInjectionsForAgent(
-            agent.name,
-            await this.hookOrchestrator.beforeInference(hookParams),
+      if (retryDispatch) {
+        if (!fallbackConfig.enabled) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            'primary_summary_fallback_disabled_before_retry',
           );
-          if (hookInjections.length > 0) {
-            injections = injections ? [...injections, ...hookInjections] : hookInjections;
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+
+        const claim = await this.claimPrimarySummaryRetryIntent(
+          retryDispatch.originalRequestId,
+          retryDispatch.intentId,
+          requestId,
+        );
+        if (claim !== 'claimed') {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            claim === 'duplicate'
+              ? 'primary_summary_fallback_duplicate_retry_blocked'
+              : 'primary_summary_fallback_retry_intent_missing',
+            { intentId: retryDispatch.intentId, retryRequestId: requestId },
+          );
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+
+        if (
+          !branch ||
+          branch.id !== retryDispatch.branch.id ||
+          branch.generation !== retryDispatch.branch.generation
+        ) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            'primary_summary_fallback_branch_changed_before_retry',
+            {
+              expectedBranchId: retryDispatch.branch.id,
+              expectedGeneration: retryDispatch.branch.generation,
+              actualBranchId: branch?.id,
+              actualGeneration: branch?.generation,
+            },
+          );
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+
+        const rebuilt = agent.buildPrimarySummaryRawExpansionRequest(
+          retryDispatch.originalArtifacts,
+          retryDispatch.candidateSummaries,
+          tools,
+        );
+        compiledRequest = rebuilt.request;
+        artifacts = rebuilt.artifacts;
+
+        const rebuiltHash = this.hashJson(compiledRequest);
+        if (
+          rebuiltHash !== retryDispatch.expectedRetryRequestHash ||
+          this.primarySummaryProjectionKeys(artifacts.compileResult.primarySummaryProjection ?? null).join('\u0000') !==
+            retryDispatch.originalProjectionKeys.join('\u0000')
+        ) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            'primary_summary_fallback_revalidation_failed_before_retry',
+            {
+              expectedRetryRequestHash: retryDispatch.expectedRetryRequestHash,
+              actualRetryRequestHash: rebuiltHash,
+            },
+          );
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+
+        const retryRecord = this.buildPrimarySummaryRequestRecord(
+          agent,
+          requestId,
+          'primary_summary_fallback_retry',
+          compiledRequest,
+          artifacts,
+          branch,
+          undefined,
+          false,
+          0,
+          undefined,
+          'pending',
+        );
+        await this.persistPrimarySummaryRequestRecord(retryRecord);
+
+        const admittedTokens = this.primarySummaryAdmissionBoundTokens(
+          retryDispatch.originalRequestInputBoundTokens,
+          compiledRequest,
+          retryDispatch.originalProviderInputTokens,
+        );
+        if (admittedTokens > retryDispatch.requestBudgetTokens) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            requestId,
+            'primary_summary_fallback_retry_over_budget',
+            {
+              admittedTokens,
+              requestBudgetTokens: retryDispatch.requestBudgetTokens,
+              retryRequestHash: rebuiltHash,
+            },
+          );
+          await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => ({
+            ...record,
+            fallbackStatus: 'held',
+            fallbackHeldReason: 'primary_summary_fallback_retry_over_budget',
+          }));
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+      } else {
+        // Gather context from modules (pull-based) and MCPL hooks (push-based)
+        // Both produce ContextInjection[] that get merged before inference.
+        let injections: ContextInjection[] | undefined;
+
+        // Module gatherContext (fail-open, per-module timeout — the module's
+        // contextTimeoutMs, else the registry default). Injections are
+        // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
+        // injections below, so conversation forks don't see cross-channel
+        // content.
+        try {
+          const moduleInjections = this.scopeInjectionsForAgent(
+            agent.name,
+            await this.moduleRegistry.gatherContext(agent.name),
+          );
+          if (moduleInjections.length > 0) {
+            injections = moduleInjections;
           }
         } catch (error) {
-          console.error('beforeInference hook error:', error);
+          console.error('Module gatherContext error:', error);
+        }
+
+        // MCPL beforeInference hooks (fail-open)
+        if (this.hookOrchestrator) {
+          try {
+            const hookParams = this.buildBeforeInferenceParams(agent, trigger);
+            const hookInjections = this.scopeInjectionsForAgent(
+              agent.name,
+              await this.hookOrchestrator.beforeInference(hookParams),
+            );
+            if (hookInjections.length > 0) {
+              injections = injections ? [...injections, ...hookInjections] : hookInjections;
+            }
+          } catch (error) {
+            console.error('beforeInference hook error:', error);
+          }
+        }
+
+        const prepared = await agent.prepareActivationRequest(tools, injections);
+        compiledRequest = prepared.request;
+        artifacts = prepared.artifacts;
+        branch = agent.getCurrentBranchGeneration();
+
+        if (fallbackConfig.enabled) {
+          const record = this.buildPrimarySummaryRequestRecord(
+            agent,
+            requestId,
+            'primary',
+            compiledRequest,
+            artifacts,
+            branch,
+            undefined,
+            false,
+            0,
+            undefined,
+            'pending',
+          );
+          await this.persistPrimarySummaryRequestRecord(record);
+          const expandedByQuarantine =
+            artifacts.compileResult.primarySummaryProjection?.selectedSummaries.some(
+              (selection) => selection.renderedAs === 'raw_expansion',
+            ) ?? false;
+          if (expandedByQuarantine) {
+            const admittedTokens = this.estimateRequestCompleteBoundTokens(compiledRequest);
+            if (admittedTokens > fallbackConfig.requestBudgetTokens) {
+              await this.holdPrimarySummaryRequest(
+                agent,
+                requestId,
+                'primary_summary_quarantine_over_budget',
+                {
+                  admittedTokens,
+                  requestBudgetTokens: fallbackConfig.requestBudgetTokens,
+                },
+              );
+              agent.reset();
+              this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+              this.eventGate?.onInferenceEnded(agent.name);
+              this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+              return;
+            }
+          }
         }
       }
 
-      const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
-
+      const { stream } = agent.startStreamFromRequest(compiledRequest, artifacts);
+      this.activeStreamContexts.set(agent.name, {
+        requestId,
+        trigger,
+        compiledRequest,
+        artifacts,
+      });
       const handle = this.driveStream(
         agent,
         stream,
         requestSnapshot,
+        requestId,
         trigger,
         attempt,
         compiledRequest,
+        artifacts,
       );
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
+      if (trigger?.primarySummaryFallbackRetry) {
+        await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+          ...record,
+          finalStatus: 'held',
+          fallbackHeldReason: err.message,
+        }));
+        await this.updatePrimarySummaryRequestRecord(trigger.primarySummaryFallbackRetry.originalRequestId, (record) => ({
+          ...record,
+          finalStatus: 'held',
+          fallbackStatus: 'held',
+          fallbackHeldReason: err.message,
+        }));
+        this.opsAlert('refusal-held', agent.name, err.message, {
+          data: { requestId, originalRequestId: trigger.primarySummaryFallbackRetry.originalRequestId },
+        });
+        agent.reset();
+        this.settleAgent(agent.name, {
+          stopReason: 'completed',
+          speech: '',
+        });
+        this.eventGate?.onInferenceEnded(agent.name);
+        this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+        return;
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -4068,14 +5191,23 @@ export class AgentFramework {
     agent: Agent,
     stream: YieldingStream,
     requestSnapshot: InferenceToolSnapshot,
-    trigger?: InferenceRequest,
+    requestId: string,
+    trigger?: PendingInferenceRequest,
     attempt = 0,
-    compiledRequest?: NormalizedRequest
+    compiledRequest?: NormalizedRequest,
+    artifacts?: ActivationCompileArtifacts,
   ): Promise<void> {
     const startTime = Date.now();
-    const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
     let hadToolCalls = false;
+    let executedToolCalls = 0;
+    const primarySummaryConfig = this.primarySummaryFallbackConfig(agent);
+    const primarySummaryRetry = trigger?.primarySummaryFallbackRetry;
+    let primarySummaryQuarantinePersisted = false;
+    const fallbackRetryRequestForLog =
+      primarySummaryRetry && compiledRequest
+        ? this.summarizePrimarySummaryRetryRequest(compiledRequest)
+        : compiledRequest ?? { note: 'streaming request' };
 
     // ---- Present-while-acting turn state ---------------------------------
     // Output locus for the current CONVERSATIONAL ROUND: resolved lazily and
@@ -4084,7 +5216,7 @@ export class AgentFramework {
     // single provider inference can now contain several conversations. The
     // pin lives in `turnLocusPins` so it survives a context-budget restart. A
     // null resolution is not pinned.
-    if (trigger?.reason !== 'context_budget_restart') {
+    if (trigger?.reason !== 'context_budget_restart' && trigger?.reason !== 'primary-summary-fallback-retry') {
       this.turnLocusPins.delete(agent.name);
       this.midTurnRoutingResets.delete(agent.name);
     }
@@ -4156,6 +5288,103 @@ export class AgentFramework {
       }
     };
 
+    const persistPrimarySummaryRetryQuarantine = async (): Promise<boolean> => {
+      if (!primarySummaryRetry || primarySummaryQuarantinePersisted || !artifacts) return true;
+      const validation = await this.validatePrimarySummaryRetryMutation(
+        agent,
+        requestId,
+        primarySummaryRetry,
+        compiledRequest!,
+        artifacts,
+        'before_quarantine',
+      );
+      if (!validation.ok) {
+        await this.holdPrimarySummaryRetryFamily(
+          agent,
+          requestId,
+          primarySummaryRetry,
+          validation.reason,
+          validation.data,
+          { emitChronicleMarker: false },
+        );
+        stream.cancel();
+        agent.reset();
+        this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+        return false;
+      }
+      try {
+        const quarantinePrimarySummaryForPrimaryLane =
+          agent.getContextManager().quarantinePrimarySummaryForPrimaryLane;
+        if (typeof quarantinePrimarySummaryForPrimaryLane !== 'function') {
+          throw new Error('Primary summary quarantine is unavailable in the active context strategy');
+        }
+        await quarantinePrimarySummaryForPrimaryLane.call(
+          agent.getContextManager(),
+          artifacts.contract,
+          primarySummaryRetry.candidateSummaries,
+        );
+        primarySummaryQuarantinePersisted = true;
+        await this.recordPrimarySummaryRetryQuarantine(
+          primarySummaryRetry.originalRequestId,
+          primarySummaryRetry.intentId,
+        );
+        return true;
+      } catch (error) {
+        const reason = 'primary_summary_fallback_quarantine_failed';
+        await this.holdPrimarySummaryRetryFamily(agent, requestId, primarySummaryRetry, reason, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        stream.cancel();
+        agent.reset();
+        this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+        return false;
+      }
+    };
+
+    const persistPrimarySummaryRetryOutput = async (
+      phase: string,
+      blocks: ContentBlock[],
+      participant = agent.name,
+    ): Promise<boolean> => {
+      if (!primarySummaryRetry || !artifacts) return true;
+      if (blocks.length === 0) return true;
+      const validation = await this.validatePrimarySummaryRetryMutation(
+        agent,
+        requestId,
+        primarySummaryRetry,
+        compiledRequest!,
+        artifacts,
+        `before_${phase}`,
+      );
+      if (!validation.ok) {
+        await this.holdPrimarySummaryRetryFamily(
+          agent,
+          requestId,
+          primarySummaryRetry,
+          validation.reason,
+          validation.data,
+          { emitChronicleMarker: false },
+        );
+        stream.cancel();
+        agent.reset();
+        this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+        return false;
+      }
+      const messageId = agent.getContextManager().addMessage(participant, blocks);
+      await this.recordPrimarySummaryRetryOutput(
+        primarySummaryRetry.originalRequestId,
+        primarySummaryRetry.intentId,
+        {
+          phase,
+          contentHash: this.primarySummaryFallbackOutputPhaseHash(blocks),
+          messageId,
+          blockTypes: this.primarySummaryFallbackBlockTypes(blocks),
+          persistedAt: Date.now(),
+        },
+      );
+      return true;
+    };
+
     try {
       for await (const event of stream) {
         this.touchEphemeralRun(agent.name, true);
@@ -4185,7 +5414,6 @@ export class AgentFramework {
           case 'tool-calls': {
             adoptInjectedRound();
             hadToolCalls = true;
-            this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
               agentName: agent.name,
@@ -4224,7 +5452,51 @@ export class AgentFramework {
 
             agent.enterWaitingForTools(event.calls, stream);
 
+            if (!(await persistPrimarySummaryRetryQuarantine())) {
+              return;
+            }
+
+            if (primarySummaryRetry) {
+              const phase = `tool_round_${event.context.depth ?? 0}`;
+              if (!(await persistPrimarySummaryRetryOutput(phase, assistantBlocks))) {
+                return;
+              }
+              this.pendingAssistantBlocks.delete(agent.name);
+            }
+
+            executedToolCalls += event.calls.length;
+            this.recordEphemeralToolCalls(agent.name, event.calls.length);
+
             for (const call of event.calls) {
+              if (primarySummaryRetry) {
+                const validation = await this.validatePrimarySummaryRetryMutation(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  compiledRequest!,
+                  artifacts!,
+                  `before_tool_dispatch_${call.id}`,
+                );
+                if (!validation.ok) {
+                  await this.holdPrimarySummaryRetryFamily(
+                    agent,
+                    requestId,
+                    primarySummaryRetry,
+                    validation.reason,
+                    validation.data,
+                    { emitChronicleMarker: false },
+                  );
+                  stream.cancel();
+                  agent.reset();
+                  this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+                  return;
+                }
+                await this.recordPrimarySummaryRetryToolDispatch(
+                  primarySummaryRetry.originalRequestId,
+                  primarySummaryRetry.intentId,
+                  call,
+                );
+              }
               this.dispatchToolCall(agent.name, call);
             }
 
@@ -4317,14 +5589,6 @@ export class AgentFramework {
               }
             }
 
-            // Add assistant response to context.
-            // If we had tool calls, each round's blocks (thinking + text +
-            // tool_use) were already stored as pendingAssistantBlocks and
-            // flushed when tool results arrived. Only store TRAILING content
-            // — blocks after the last tool block. A type-based filter would
-            // double-store earlier rounds' text/thinking AND detach signed
-            // thinking blocks from their tool_use turn (the API requires
-            // thinking to precede tool_use in the same assistant turn).
             const lastToolIdx = response.content.reduce(
               (last: number, b: ContentBlock, i: number) =>
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
@@ -4333,12 +5597,206 @@ export class AgentFramework {
             const terminalContent = lastToolIdx >= 0
               ? response.content.slice(lastToolIdx + 1)
               : response.content;
+            const visibleAssistantOutput = this.hasVisibleAssistantOutput(response.content);
+            const providerInputTokens =
+              response.usage?.inputTokens ??
+              response.details?.usage?.inputTokens;
+
+            if (primarySummaryConfig.enabled && compiledRequest && artifacts && response.stopReason === 'refusal') {
+              const stopDetails = (response.raw?.response as {
+                stop_details?: { category?: string; explanation?: string };
+              } | undefined)?.stop_details;
+              const category = stopDetails?.category ?? 'unknown';
+              console.error(
+                `[inference-refusal] agent=${agent.name} category=${category}` +
+                  (stopDetails?.explanation ? ` explanation=${stopDetails.explanation}` : ''),
+              );
+              this.noteRefusal(agent.name, category, response.details?.usage
+                ? {
+                    input: response.details.usage.inputTokens,
+                    output: response.details.usage.outputTokens,
+                  }
+                : undefined);
+
+              const currentRecord = await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                ...record,
+                stopReason: response.stopReason,
+                providerInputTokens,
+                visibleAssistantOutput,
+                executedToolCalls,
+                finalStatus: 'refusal',
+              }));
+
+              const holdReasonData = {
+                category,
+                visibleAssistantOutput,
+                executedToolCalls,
+                candidateLimit: primarySummaryConfig.maxNewSummaries,
+              };
+
+              if (primarySummaryRetry) {
+                const reason = visibleAssistantOutput
+                  ? 'primary_summary_fallback_retry_partial_output'
+                  : executedToolCalls > 0
+                    ? 'primary_summary_fallback_retry_tool_already_executed'
+                    : 'primary_summary_fallback_retry_refusal';
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  reason,
+                  holdReasonData,
+                );
+              } else if (visibleAssistantOutput || executedToolCalls > 0 || !currentRecord?.projection) {
+                const reason = visibleAssistantOutput
+                  ? 'primary_summary_refusal_partial_output'
+                  : executedToolCalls > 0
+                    ? 'primary_summary_refusal_tool_already_executed'
+                    : 'primary_summary_refusal_no_projection';
+                await this.holdPrimarySummaryRequest(agent, requestId, reason, holdReasonData);
+              } else {
+                const state = this.readPrimarySummaryFallbackState();
+                const baseline = this.latestCompatibleHealthyPrimaryRequest(currentRecord, state);
+                if (!baseline?.projection) {
+                  await this.holdPrimarySummaryRequest(
+                    agent,
+                    requestId,
+                    'primary_summary_refusal_no_compatible_healthy_baseline',
+                    holdReasonData,
+                  );
+                } else {
+                  const baselineKeys = new Set(this.primarySummaryProjectionKeys(baseline.projection));
+                  const candidates = currentRecord.projection.selectedSummaries
+                    .filter((selection) => !baselineKeys.has(this.primarySummaryIdentityKey(selection.identity)))
+                    .map((selection) => selection.identity);
+                  if (candidates.length === 0) {
+                    await this.holdPrimarySummaryRequest(
+                      agent,
+                      requestId,
+                      'primary_summary_refusal_no_newly_admitted_candidates',
+                      holdReasonData,
+                    );
+                  } else if (candidates.length > primarySummaryConfig.maxNewSummaries) {
+                    await this.holdPrimarySummaryRequest(
+                      agent,
+                      requestId,
+                      'primary_summary_refusal_too_many_candidates',
+                      { ...holdReasonData, candidateCount: candidates.length },
+                    );
+                  } else {
+                    try {
+                      const retry = agent.buildPrimarySummaryRawExpansionRequest(
+                        artifacts,
+                        candidates,
+                        compiledRequest.tools ?? [],
+                      );
+                      const retryRequestHash = this.hashJson(retry.request);
+                      const admittedTokens = this.primarySummaryAdmissionBoundTokens(
+                        currentRecord.requestInputBoundTokens,
+                        retry.request,
+                        providerInputTokens,
+                      );
+                      if (admittedTokens > primarySummaryConfig.requestBudgetTokens) {
+                        await this.holdPrimarySummaryRequest(
+                          agent,
+                          requestId,
+                          'primary_summary_refusal_retry_over_budget',
+                          {
+                            ...holdReasonData,
+                            admittedTokens,
+                            requestBudgetTokens: primarySummaryConfig.requestBudgetTokens,
+                          },
+                        );
+                      } else {
+                        const intentId = `${requestId}:fallback:${Math.random().toString(36).slice(2, 8)}`;
+                        await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                          ...record,
+                          fallbackIntent: {
+                            intentId,
+                            createdAt: Date.now(),
+                            baselineRequestId: baseline.requestId,
+                            candidateSummaries: candidates,
+                            retryRequestHash,
+                            retryCompleteBoundTokens: admittedTokens,
+                            requestBudgetTokens: primarySummaryConfig.requestBudgetTokens,
+                          },
+                          fallbackStatus: 'pending',
+                        }));
+                        this.pendingRequests.push({
+                          agentName: agent.name,
+                          reason: 'primary-summary-fallback-retry',
+                          source: 'framework',
+                          timestamp: Date.now(),
+                          channelId: trigger?.channelId,
+                          primarySummaryFallbackRetry: {
+                            originalRequestId: requestId,
+                            baselineRequestId: baseline.requestId,
+                            intentId,
+                            branch: {
+                              id: currentRecord.branch.id,
+                              generation: currentRecord.branch.generation,
+                            },
+                            candidateSummaries: candidates,
+                            originalArtifacts: artifacts,
+                            originalProjectionKeys: this.primarySummaryProjectionKeys(currentRecord.projection),
+                            expectedRetryRequestHash: retryRequestHash,
+                            requestBudgetTokens: primarySummaryConfig.requestBudgetTokens,
+                            originalRequestInputBoundTokens: currentRecord.requestInputBoundTokens,
+                            originalProviderInputTokens: providerInputTokens,
+                          },
+                        });
+                      }
+                    } catch (error) {
+                      await this.holdPrimarySummaryRequest(
+                        agent,
+                        requestId,
+                        'primary_summary_refusal_retry_build_failed',
+                        {
+                          ...holdReasonData,
+                          error: error instanceof Error ? error.message : String(error),
+                        },
+                      );
+                    }
+                  }
+                }
+              }
+
+              agent.reset();
+              this.eventGate?.onInferenceEnded(agent.name);
+              this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+              continue;
+            }
+
+            if (!(await persistPrimarySummaryRetryQuarantine())) {
+              return;
+            }
+
+            // Add assistant response to context.
+            // If we had tool calls, each round's blocks (thinking + text +
+            // tool_use) were already stored as pendingAssistantBlocks and
+            // flushed when tool results arrived. Only store TRAILING content
+            // — blocks after the last tool block. A type-based filter would
+            // double-store earlier rounds' text/thinking AND detach signed
+            // thinking blocks from their tool_use turn (the API requires
+            // thinking to precede tool_use in the same assistant turn).
             if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                agent.addAssistantResponse(terminalContent);
+                if (primarySummaryRetry) {
+                  if (!(await persistPrimarySummaryRetryOutput('terminal', terminalContent))) {
+                    return;
+                  }
+                } else {
+                  agent.addAssistantResponse(terminalContent);
+                }
               }
             } else {
-              agent.addAssistantResponse(terminalContent);
+              if (primarySummaryRetry) {
+                if (!(await persistPrimarySummaryRetryOutput('terminal', terminalContent))) {
+                  return;
+                }
+              } else {
+                agent.addAssistantResponse(terminalContent);
+              }
             }
 
             // Run afterInference hooks (no-op if no MCPL servers)
@@ -4400,6 +5858,50 @@ export class AgentFramework {
                 }
               : undefined;
 
+            if (primarySummaryRetry && artifacts) {
+              const validation = await this.validatePrimarySummaryRetryMutation(
+                agent,
+                requestId,
+                primarySummaryRetry,
+                compiledRequest!,
+                artifacts,
+                'before_success_markers',
+              );
+              if (!validation.ok) {
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  validation.reason,
+                  validation.data,
+                  { emitChronicleMarker: false },
+                );
+                return;
+              }
+            }
+
+            if (primarySummaryConfig.enabled) {
+              if (primarySummaryRetry) {
+                await this.markPrimarySummaryRetrySuccess(
+                  requestId,
+                  primarySummaryRetry,
+                  response.stopReason,
+                  providerInputTokens,
+                  visibleAssistantOutput,
+                  executedToolCalls,
+                );
+              } else {
+                await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                  ...record,
+                  stopReason: response.stopReason,
+                  providerInputTokens,
+                  visibleAssistantOutput,
+                  executedToolCalls,
+                  finalStatus: 'success',
+                }));
+              }
+            }
+
             // Reset agent state before emitting inference:completed. Traces are
             // observability-only, but external synchronous listeners should
             // still see the terminal state at the terminal trace boundary.
@@ -4438,8 +5940,10 @@ export class AgentFramework {
               agentName: agent.name,
               requestId,
               success: true,
-              request: compiledRequest ?? { note: 'streaming request' },
-              response: response.raw ?? { note: 'streaming response' },
+              request: fallbackRetryRequestForLog,
+              response: primarySummaryRetry
+                ? this.summarizePrimarySummaryRetryResponse(response)
+                : response.raw ?? { note: 'streaming response' },
               durationMs,
               tokenUsage,
               stopReason: response.stopReason,
@@ -4661,12 +6165,29 @@ export class AgentFramework {
               requestId,
               success: false,
               error: err.message,
-              request: compiledRequest ?? { note: 'streaming request failed' },
+              request: fallbackRetryRequestForLog,
               durationMs,
             });
 
             // Only reset + retry if this is still the active stream
             if (agent.streamId !== myStreamId) break;
+
+            if (primarySummaryRetry) {
+              await this.holdPrimarySummaryRetryFamily(
+                agent,
+                requestId,
+                primarySummaryRetry,
+                'primary_summary_fallback_retry_stream_error',
+                { error: err.message },
+              );
+              agent.reset();
+              this.eventGate?.onInferenceEnded(agent.name);
+              this.settleAgent(agent.name, {
+                stopReason: 'completed',
+                speech: '',
+              });
+              return;
+            }
 
             agent.reset();
 
@@ -4707,6 +6228,17 @@ export class AgentFramework {
             // reject an ephemeral's promise mid-run and bump the failure
             // streak). Gate release + stream teardown happen in `finally`.
             if (this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`)) {
+              if (primarySummaryRetry) {
+                if (!(await this.primarySummaryRetryFamilyAlreadySettled(requestId, primarySummaryRetry))) {
+                  await this.holdPrimarySummaryRetryFamily(
+                    agent,
+                    requestId,
+                    primarySummaryRetry,
+                    'primary_summary_fallback_retry_cancelled_before_success',
+                    { frameworkCancelled: true },
+                  );
+                }
+              }
               this.eventGate?.onInferenceEnded(agent.name);
               return;
             }
@@ -4715,6 +6247,40 @@ export class AgentFramework {
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
               const durationMs = Date.now() - startTime;
+              if (primarySummaryRetry) {
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  `stream_aborted:${reason}`,
+                  { reason },
+                  { stopReason: 'abort' },
+                );
+                agent.reset();
+                this.eventGate?.onInferenceEnded(agent.name);
+                this.logInference({
+                  timestamp: startTime,
+                  agentName: agent.name,
+                  requestId,
+                  success: false,
+                  error: `Stream aborted: ${reason}`,
+                  request: fallbackRetryRequestForLog,
+                  durationMs,
+                });
+                this.settleAgent(agent.name, {
+                  stopReason: 'completed',
+                  speech: '',
+                });
+                return;
+              }
+              if (primarySummaryConfig.enabled) {
+                await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                  ...record,
+                  stopReason: 'abort',
+                  finalStatus: 'error',
+                  fallbackHeldReason: `stream_aborted:${reason}`,
+                }));
+              }
               agent.reset();
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
@@ -4738,7 +6304,7 @@ export class AgentFramework {
                 requestId,
                 success: false,
                 error: `Stream aborted: ${reason}`,
-                request: compiledRequest ?? { note: 'streaming request aborted' },
+                request: fallbackRetryRequestForLog,
                 durationMs,
               });
               this.eventGate?.onInferenceEnded(agent.name);
@@ -4790,12 +6356,63 @@ export class AgentFramework {
       // inference:exhausted so ephemeral agent promises can settle.
       const err = error instanceof Error ? error : new Error(String(error));
       const durationMs = Date.now() - startTime;
+      if (primarySummaryRetry) {
+        if (await this.primarySummaryRetryAlreadySucceeded(requestId, primarySummaryRetry)) {
+          this.logInference({
+            timestamp: startTime,
+            agentName: agent.name,
+            requestId,
+            success: true,
+            request: fallbackRetryRequestForLog,
+            response: { kind: 'primary_summary_fallback_retry', postSuccessError: err.message },
+            durationMs,
+          });
+          agent.reset();
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.settleAgent(agent.name, {
+            stopReason: 'completed',
+            speech: '',
+          });
+          return;
+        }
+        await this.holdPrimarySummaryRetryFamily(
+          agent,
+          requestId,
+          primarySummaryRetry,
+          'primary_summary_fallback_retry_stream_threw',
+          { error: err.message },
+        );
+      } else if (primarySummaryConfig.enabled) {
+        await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+          ...record,
+          finalStatus: 'error',
+          fallbackHeldReason: err.message,
+        }));
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
         error: err.message,
         stack: err.stack,
       });
+      if (primarySummaryRetry) {
+        this.logInference({
+          timestamp: startTime,
+          agentName: agent.name,
+          requestId,
+          success: false,
+          error: `Stream threw: ${err.message}`,
+          request: fallbackRetryRequestForLog,
+          durationMs,
+        });
+        agent.reset();
+        this.eventGate?.onInferenceEnded(agent.name);
+        this.settleAgent(agent.name, {
+          stopReason: 'completed',
+          speech: '',
+        });
+        return;
+      }
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
@@ -4816,7 +6433,7 @@ export class AgentFramework {
         requestId,
         success: false,
         error: `Stream threw: ${err.message}`,
-        request: compiledRequest ?? { note: 'streaming request threw' },
+        request: fallbackRetryRequestForLog,
         durationMs,
       });
       agent.reset();
@@ -4837,6 +6454,7 @@ export class AgentFramework {
       this.channelRegistry?.stopTyping();
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       this.activeStreams.delete(agent.name);
+      this.activeStreamContexts.delete(agent.name);
       this.pendingAssistantBlocks.delete(agent.name);
 
       // A conversation fork whose TTL closure turn just finished is done for
@@ -5329,12 +6947,23 @@ export class AgentFramework {
    * work, per-agent status + last inference activity. Cheap and read-only.
    */
   healthSnapshot(): Record<string, unknown> {
+    const primarySummary = this.readPrimarySummaryFallbackState();
     return {
       at: new Date().toISOString(),
       uptimeSec: Math.round(process.uptime()),
       gate: this.eventGate?.inferenceDiagnostics() ?? null,
       pendingRequests: this.pendingRequests.length,
       activeStreams: [...this.activeStreams.keys()],
+      primarySummaryFallback: {
+        requests: primarySummary.requests.length,
+        pendingDispatches: primarySummary.requests.filter((record) => record.finalStatus === 'pending').length,
+        unresolvedIntents: primarySummary.requests.filter((record) => record.fallbackStatus === 'pending').length,
+        held: primarySummary.requests.filter((record) =>
+          record.finalStatus === 'held' ||
+          record.finalStatus === 'timeout_unknown' ||
+          record.fallbackStatus === 'held' ||
+          record.fallbackStatus === 'timeout_unknown').length,
+      },
       agents: [...this.agents.entries()].map(([name, agent]) => ({
         name,
         status: agent.state.status,

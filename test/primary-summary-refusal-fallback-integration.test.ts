@@ -1,0 +1,975 @@
+import { after, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, rmSync } from 'node:fs';
+
+import type {
+  ContentBlock,
+  NormalizedRequest,
+  NormalizedResponse,
+  StreamEvent,
+  YieldingStream,
+} from '@animalabs/membrane';
+import {
+  AutobiographicalStrategy,
+  type PrimarySummaryIdentity,
+  type SummaryEntry,
+} from '@animalabs/context-manager';
+
+import type {
+  EventResponse,
+  Module,
+  ModuleContext,
+  ProcessEvent,
+  ProcessState,
+  ToolCall,
+  ToolDefinition,
+  ToolResult,
+} from '../src/index.js';
+import { AgentFramework } from '../src/index.js';
+import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+
+const NODELESS_DATE = '2026-07-17T00:00:00.000Z';
+const FALLBACK_STATE_ID = 'framework/primary-summary-fallback';
+const RAW_PRIVATE_SENTINEL = 'RAW_PRIVATE_SENTINEL_2026_07_17';
+const SUMMARY_PRIVATE_SENTINEL = 'SUMMARY_PRIVATE_SENTINEL_2026_07_17';
+const RETRY_OUTPUT_SENTINEL = 'RETRY_OUTPUT_SENTINEL_2026_07_17';
+const TOOL_ARG_SENTINEL = 'TOOL_ARG_SENTINEL_2026_07_17';
+const TOOL_RESULT_SENTINEL = 'TOOL_RESULT_SENTINEL_2026_07_17';
+
+const paths: string[] = [];
+let fixtureSequence = 0;
+
+function freshPath(): string {
+  const path = `./test-primary-summary-refusal-fallback-int-${fixtureSequence++}`;
+  paths.push(path);
+  return path;
+}
+
+after(() => {
+  for (const path of paths) {
+    if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+  }
+});
+
+class ProbeStrategy extends AutobiographicalStrategy {
+  seed(entry: SummaryEntry): void {
+    this.pushSummary(entry);
+  }
+}
+
+class ScriptedMembrane {
+  readonly calls: NormalizedRequest[] = [];
+
+  constructor(private readonly streams: Array<NormalizedResponse[] | YieldingStream>) {}
+
+  complete(): Promise<NormalizedResponse> {
+    throw new Error('complete() is not used by the primary streaming path');
+  }
+
+  streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(structuredClone(request));
+    const next = this.streams.shift();
+    if (!next) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'default' }])]);
+    return Array.isArray(next) ? new MockYieldingStream(next) : next;
+  }
+
+  asMembrane(): import('@animalabs/membrane').Membrane {
+    return this as unknown as import('@animalabs/membrane').Membrane;
+  }
+}
+
+class ErrorStream implements YieldingStream {
+  readonly isWaitingForTools = false;
+  readonly pendingToolCallIds: string[] = [];
+  readonly toolDepth = 0;
+
+  constructor(private readonly message: string) {}
+
+  provideToolResults(): void {
+    throw new Error('ErrorStream does not support tool rounds');
+  }
+
+  cancel(): void {}
+
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'error', error: new Error(this.message) } as StreamEvent;
+  }
+}
+
+class AbortedStream implements YieldingStream {
+  readonly isWaitingForTools = false;
+  readonly pendingToolCallIds: string[] = [];
+  readonly toolDepth = 0;
+
+  constructor(private readonly reason: string) {}
+
+  provideToolResults(): void {
+    throw new Error('AbortedStream does not support tool rounds');
+  }
+
+  cancel(): void {}
+
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'aborted', reason: this.reason } as StreamEvent;
+  }
+}
+
+class HookedCompleteStream implements YieldingStream {
+  readonly isWaitingForTools = false;
+  readonly pendingToolCallIds: string[] = [];
+  readonly toolDepth = 0;
+
+  constructor(
+    private readonly response: NormalizedResponse,
+    private readonly beforeYield?: () => Promise<void> | void,
+  ) {}
+
+  provideToolResults(): void {
+    throw new Error('HookedCompleteStream does not support tool rounds');
+  }
+
+  cancel(): void {}
+
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    await this.beforeYield?.();
+    yield { type: 'complete', response: this.response } as StreamEvent;
+  }
+}
+
+class EchoModule implements Module {
+  readonly name = 'toolbox';
+  private ctx: ModuleContext | null = null;
+  readonly calls: ToolCall[] = [];
+  readonly quarantineObserved: boolean[] = [];
+
+  constructor(private readonly isQuarantineVisible: () => boolean) {}
+
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+  }
+
+  async stop(): Promise<void> {
+    this.ctx = null;
+  }
+
+  getTools(): ToolDefinition[] {
+    return [{
+      name: 'echo',
+      description: 'Echoes a sentinel payload',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string' },
+        },
+        required: ['message'],
+      },
+    }];
+  }
+
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    this.calls.push(call);
+    this.quarantineObserved.push(this.isQuarantineVisible());
+    return {
+      success: true,
+      data: { echoed: TOOL_RESULT_SENTINEL },
+    };
+  }
+
+  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    return {};
+  }
+}
+
+function refusalResponse(content: ContentBlock[] = []): NormalizedResponse {
+  return {
+    ...createMockResponse(content, 'refusal'),
+    content,
+    stopReason: 'refusal',
+    rawAssistantText: '',
+    toolCalls: [],
+    usage: { inputTokens: 40, outputTokens: 0 },
+    details: {
+      usage: { inputTokens: 40, outputTokens: 0 },
+      stop: { reason: 'refusal', wasTruncated: false },
+    },
+    raw: {
+      response: {
+        stop_details: { category: 'reasoning_extraction' },
+      },
+    },
+  } as unknown as NormalizedResponse;
+}
+
+function toolRoundResponse(): NormalizedResponse {
+  return createMockResponse([
+    { type: 'text', text: 'checking tool path' },
+    { type: 'tool_use', id: 'call-1', name: 'toolbox--echo', input: { message: TOOL_ARG_SENTINEL } } as ContentBlock,
+  ], 'tool_use');
+}
+
+function outputResponse(text = RETRY_OUTPUT_SENTINEL): NormalizedResponse {
+  return createMockResponse([{ type: 'text', text }]);
+}
+
+function summary(id: string, sourceIds: string[], first: string, last: string, content: string): SummaryEntry {
+  return {
+    id,
+    level: 1,
+    content,
+    tokens: 20,
+    sourceLevel: 0,
+    sourceIds,
+    sourceRange: { first, last },
+    created: 1,
+  };
+}
+
+function fallbackState(framework: AgentFramework): { requests: Array<Record<string, unknown>> } {
+  const raw = framework.getStore().getStateJson(FALLBACK_STATE_ID);
+  return raw && typeof raw === 'object'
+    ? raw as { requests: Array<Record<string, unknown>> }
+    : { requests: [] };
+}
+
+function primarySummaryQuarantineState(framework: AgentFramework, agentName: string): unknown {
+  return framework.getStore().getStateJson(`agents/${agentName}/autobio:primary-summary-quarantine`);
+}
+
+function jsonContains(value: unknown, needle: string): boolean {
+  return JSON.stringify(value ?? null).includes(needle);
+}
+
+function countMessagesContaining(messages: Array<{ content: ContentBlock[] }>, needle: string): number {
+  return messages.filter((message) => JSON.stringify(message.content).includes(needle)).length;
+}
+
+function branchInfo(id = 'main', generation = 1) {
+  return {
+    id,
+    name: id,
+    head: 1,
+    generation,
+    created: new Date(NODELESS_DATE),
+  };
+}
+
+function fallbackRecords(framework: AgentFramework): Array<Record<string, unknown>> {
+  return fallbackState(framework).requests;
+}
+
+async function createFrameworkFixture(options?: {
+  path?: string;
+  membrane?: ScriptedMembrane;
+  strategy?: ProbeStrategy;
+  agentName?: string;
+  modules?: Module[];
+  extraAgents?: Array<{ name: string; strategy: ProbeStrategy }>;
+  maxStreamTokens?: number;
+}): Promise<{
+  path: string;
+  framework: AgentFramework;
+  agent: NonNullable<ReturnType<AgentFramework['getAgent']>>;
+  strategy: ProbeStrategy;
+  membrane: ScriptedMembrane;
+}> {
+  const path = options?.path ?? freshPath();
+  const strategy = options?.strategy ?? new ProbeStrategy({
+    compressionModel: 'same-model',
+    targetChunkTokens: 100,
+    recentWindowTokens: 0,
+    headWindowTokens: 0,
+    autoTickOnNewMessage: false,
+    minChunkCharsForLLM: 0,
+    mergeThreshold: 99,
+  });
+  const membrane = options?.membrane ?? new ScriptedMembrane([]);
+  const agentName = options?.agentName ?? 'assistant';
+  const agents = [
+    {
+      name: agentName,
+      model: 'test-model',
+      systemPrompt: 'system',
+      strategy,
+      ...(options?.maxStreamTokens !== undefined ? { maxStreamTokens: options.maxStreamTokens } : {}),
+      refusalHandling: {
+        primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 100_000 },
+      },
+    },
+    ...((options?.extraAgents ?? []).map((entry) => ({
+      name: entry.name,
+      model: 'test-model',
+      systemPrompt: 'system',
+      strategy: entry.strategy,
+      refusalHandling: {
+        primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 100_000 },
+      },
+    }))),
+  ];
+  const framework = await AgentFramework.create({
+    storePath: path,
+    membrane: membrane.asMembrane(),
+    agents,
+    modules: options?.modules ?? [],
+  });
+  const agent = framework.getAgent(agentName)!;
+  return { path, framework, agent, strategy, membrane };
+}
+
+function addSourcePair(agent: NonNullable<ReturnType<AgentFramework['getAgent']>>, label: string): string[] {
+  const manager = agent.getContextManager();
+  return [
+    manager.addMessage('User', [{ type: 'text', text: `${RAW_PRIVATE_SENTINEL}:${label}:user ${'u '.repeat(30)}` }]),
+    manager.addMessage(agent.name, [{ type: 'text', text: `${RAW_PRIVATE_SENTINEL}:${label}:assistant ${'a '.repeat(30)}` }]),
+  ];
+}
+
+function addLatestPrompt(agent: NonNullable<ReturnType<AgentFramework['getAgent']>>, label: string): string {
+  return agent.getContextManager().addMessage('User', [{ type: 'text', text: `latest ${label} ${'l '.repeat(20)}` }]);
+}
+
+function seedSummary(strategy: ProbeStrategy, id: string, sourceIds: string[]): void {
+  strategy.seed(summary(
+    id,
+    sourceIds,
+    sourceIds[0]!,
+    sourceIds[sourceIds.length - 1]!,
+    `${SUMMARY_PRIVATE_SENTINEL}:${id}`,
+  ));
+}
+
+async function persistHealthyBaseline(
+  framework: AgentFramework,
+  agent: NonNullable<ReturnType<AgentFramework['getAgent']>>,
+  requestId = 'baseline-request',
+): Promise<void> {
+  const tools = framework.getAllTools().filter((tool) => agent.canUseTool(tool.name));
+  const prepared = await agent.prepareActivationRequest(tools);
+  const build = (framework as unknown as {
+    buildPrimarySummaryRequestRecord: (...args: unknown[]) => Record<string, unknown>;
+  }).buildPrimarySummaryRequestRecord.bind(framework);
+  const persist = (framework as unknown as {
+    persistPrimarySummaryRequestRecord: (record: Record<string, unknown>) => Promise<void>;
+  }).persistPrimarySummaryRequestRecord.bind(framework);
+  const record = build(
+    agent,
+    requestId,
+    'primary',
+    prepared.request,
+    prepared.artifacts,
+    agent.getCurrentBranchGeneration() ?? branchInfo(),
+    'end_turn',
+    true,
+    0,
+    30,
+    'success',
+  );
+  await persist(record);
+}
+
+async function enqueueAndDrain(framework: AgentFramework, agentName = 'assistant'): Promise<void> {
+  (framework as unknown as {
+    pendingRequests: Array<Record<string, unknown>>;
+  }).pendingRequests.push({
+    agentName,
+    reason: 'test',
+    source: 'test',
+    timestamp: Date.now(),
+  });
+  await framework.runUntilIdle();
+}
+
+async function runPrimaryOnly(
+  framework: AgentFramework,
+  agent: NonNullable<ReturnType<AgentFramework['getAgent']>>,
+): Promise<void> {
+  await (framework as unknown as {
+    startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+  }).startAgentStream(agent, {
+    agentName: agent.name,
+    reason: 'test',
+    source: 'test',
+    timestamp: Date.now(),
+  });
+  const active = (framework as unknown as {
+    activeStreams: Map<string, Promise<void>>;
+  }).activeStreams.get(agent.name);
+  if (active) await active;
+}
+
+function fallbackRetryRecords(framework: AgentFramework): Array<Record<string, unknown>> {
+  return fallbackRecords(framework).filter((record) => record.dispatchKind === 'primary_summary_fallback_retry');
+}
+
+function latestPrimaryRecord(framework: AgentFramework, requestIdExclusions: string[] = ['baseline-request']): Record<string, unknown> {
+  return fallbackRecords(framework)
+    .filter((record) =>
+      record.dispatchKind === 'primary'
+      && !requestIdExclusions.includes(String(record.requestId)))
+    .at(-1)!;
+}
+
+function resolvedFallbackRetryLogs(framework: AgentFramework): Array<Record<string, unknown>> {
+  return framework.queryInferenceLogs({ limit: 100 }).entries
+    .map(({ sequence }) => framework.getInferenceLog(sequence, true)!)
+    .filter((entry) =>
+      (entry.entry.request as { kind?: string } | undefined)?.kind === 'primary_summary_fallback_retry'
+      || (entry.entry.response as { kind?: string } | undefined)?.kind === 'primary_summary_fallback_retry')
+    .map((entry) => entry.entry as unknown as Record<string, unknown>);
+}
+
+describe('primary summary refusal fallback integration', () => {
+  it('holds a retry stream error without entering the generic retry loop and survives restart', async () => {
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      new ErrorStream('transport broke during retry'),
+    ]);
+    const { path, framework, agent, strategy } = await createFrameworkFixture({ membrane });
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'current');
+
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 2, 'one refusal family may dispatch the provider at most twice');
+      assert.equal(fallbackRetryRecords(framework).length, 1, 'retry record must stay singular');
+      assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
+
+      const records = fallbackRecords(framework);
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.fallbackStatus, 'held');
+      assert.equal(original.fallbackHeldReason, 'primary_summary_fallback_retry_stream_error');
+      assert.equal(retry.finalStatus, 'held');
+      assert.equal(retry.fallbackHeldReason, 'primary_summary_fallback_retry_stream_error');
+    } finally {
+      await framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: new ProbeStrategy({
+        compressionModel: 'same-model',
+        targetChunkTokens: 100,
+        recentWindowTokens: 0,
+        headWindowTokens: 0,
+        autoTickOnNewMessage: false,
+        minChunkCharsForLLM: 0,
+        mergeThreshold: 99,
+      }),
+    });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0, 'restart must not resend an ambiguous fallback retry');
+      const records = fallbackRecords(restarted.framework);
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.fallbackStatus, 'held');
+      assert.equal(retry.finalStatus, 'held');
+      assert.deepEqual(
+        restarted.framework.healthSnapshot().primarySummaryFallback,
+        { requests: 3, pendingDispatches: 0, unresolvedIntents: 0, held: 2 },
+      );
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('holds an aborted retry as held and never resends it on restart', async () => {
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      new AbortedStream('timeout'),
+    ]);
+    const { path, framework, agent, strategy } = await createFrameworkFixture({ membrane });
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'current');
+
+      await enqueueAndDrain(framework);
+      assert.equal(membrane.calls.length, 2);
+      const original = latestPrimaryRecord(framework);
+      assert.equal(original.fallbackHeldReason, 'stream_aborted:timeout');
+    } finally {
+      await framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      const original = latestPrimaryRecord(restarted.framework);
+      assert.equal(original.fallbackHeldReason, 'stream_aborted:timeout');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('excludes successful fallback retries from the healthy baseline search', async () => {
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [outputResponse('recovered-p2')],
+      [refusalResponse()],
+    ]);
+    const { framework, agent, strategy } = await createFrameworkFixture({ membrane });
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'p2');
+      await enqueueAndDrain(framework);
+
+      const c = addSourcePair(agent, 'C');
+      seedSummary(strategy, 'L1-C', c);
+      addLatestPrompt(agent, 'p3');
+      await runPrimaryOnly(framework, agent);
+
+      const p3 = latestPrimaryRecord(framework);
+      const candidateIds = ((p3.fallbackIntent as { candidateSummaries?: Array<{ id: string }> }).candidateSummaries ?? [])
+        .map((item) => item.id);
+      assert.deepEqual(candidateIds, ['L1-B', 'L1-C']);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('persists quarantine before tool dispatch, stores canonical output exactly once, and keeps fallback logs metadata-only', async () => {
+    let frameworkRef: AgentFramework | null = null;
+    const module = new EchoModule(() =>
+      jsonContains(primarySummaryQuarantineState(frameworkRef!, 'assistant'), 'L1-B'),
+    );
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [toolRoundResponse(), outputResponse()],
+    ]);
+    const { framework, agent, strategy } = await createFrameworkFixture({ membrane, modules: [module] });
+    frameworkRef = framework;
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'tool-retry');
+
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 2);
+      assert.equal(module.calls.length, 1, 'tool executes exactly once');
+      assert.deepEqual(module.quarantineObserved, [true], 'quarantine must be durable before tool dispatch');
+
+      const messages = (agent.getContextManager() as unknown as {
+        getAllMessages: () => Array<{ content: ContentBlock[] }>;
+      }).getAllMessages();
+      assert.equal(countMessagesContaining(messages, TOOL_ARG_SENTINEL), 1, 'tool_use assistant output is persisted exactly once');
+      assert.equal(countMessagesContaining(messages, TOOL_RESULT_SENTINEL), 1, 'tool_result is persisted exactly once');
+      assert.equal(countMessagesContaining(messages, RETRY_OUTPUT_SENTINEL), 1, 'trailing assistant output is persisted exactly once');
+
+      const retryLogs = resolvedFallbackRetryLogs(framework);
+      assert.ok(retryLogs.length >= 1, 'fallback retry should produce an inference log entry');
+      for (const entry of retryLogs) {
+        assert.equal(jsonContains(entry, RAW_PRIVATE_SENTINEL), false);
+        assert.equal(jsonContains(entry, SUMMARY_PRIVATE_SENTINEL), false);
+        assert.equal(jsonContains(entry, TOOL_ARG_SENTINEL), false);
+        assert.equal(jsonContains(entry, TOOL_RESULT_SENTINEL), false);
+      }
+
+      const observabilityMaterial = [
+        fallbackState(framework),
+        primarySummaryQuarantineState(framework, 'assistant'),
+        ...retryLogs,
+      ];
+      for (const material of observabilityMaterial) {
+        assert.equal(jsonContains(material, RAW_PRIVATE_SENTINEL), false);
+        assert.equal(jsonContains(material, SUMMARY_PRIVATE_SENTINEL), false);
+        assert.equal(jsonContains(material, TOOL_ARG_SENTINEL), false);
+        assert.equal(jsonContains(material, TOOL_RESULT_SENTINEL), false);
+      }
+      assert.equal(jsonContains(messages, TOOL_ARG_SENTINEL), true, 'canonical Chronicle output still carries the lived tool input');
+      assert.equal(jsonContains(messages, TOOL_RESULT_SENTINEL), true, 'canonical Chronicle output still carries the lived tool result');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('holds a fallback retry instead of queueing a context-budget restart after a tool result', async () => {
+    let frameworkRef: AgentFramework | null = null;
+    const module = new EchoModule(() =>
+      jsonContains(primarySummaryQuarantineState(frameworkRef!, 'assistant'), 'L1-B'),
+    );
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [toolRoundResponse()],
+    ]);
+    const { framework, agent, strategy } = await createFrameworkFixture({
+      membrane,
+      modules: [module],
+      maxStreamTokens: 5,
+    });
+    frameworkRef = framework;
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'budget-restart-repro');
+
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 2, 'fallback tool-result over-budget must not trigger a third provider call');
+      assert.equal(module.calls.length, 1, 'tool must execute exactly once');
+      assert.deepEqual(module.quarantineObserved, [true], 'tool dispatch still runs against durable quarantine state');
+
+      const queuedRequests = (framework as unknown as {
+        pendingRequests: Array<{ reason?: string }>;
+      }).pendingRequests;
+      assert.equal(
+        queuedRequests.filter((request) => request.reason === 'context_budget_restart').length,
+        0,
+        'no context_budget_restart may remain queued for the held fallback family',
+      );
+
+      const records = fallbackRecords(framework);
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.finalStatus, 'held');
+      assert.equal(original.fallbackStatus, 'held');
+      assert.equal(original.fallbackHeldReason, 'primary_summary_fallback_context_budget_restart_required');
+      assert.equal(retry.finalStatus, 'held');
+      assert.equal(retry.fallbackHeldReason, 'primary_summary_fallback_context_budget_restart_required');
+      assert.equal(fallbackRetryRecords(framework).length, 1, 'the held retry family must remain singular');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+    it('discards a completed retry result after a branch switch mid-await', async () => {
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      new HookedCompleteStream(outputResponse(), async () => {
+        const manager = agentRef!.getContextManager();
+        const firstMessageId = (manager as unknown as { getAllMessages: () => Array<{ id: string }> }).getAllMessages()[0]!.id;
+        const fork = manager.branchAt(firstMessageId, 'branch-switch-fork');
+        await manager.switchBranch(fork);
+      }),
+    ]);
+    let agentRef: NonNullable<ReturnType<AgentFramework['getAgent']>> | null = null;
+    const { framework, agent, strategy } = await createFrameworkFixture({ membrane });
+    agentRef = agent;
+    try {
+      const mainBranch = agent.getContextManager().currentBranch().name;
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'current');
+
+      await enqueueAndDrain(framework);
+      assert.equal(jsonContains(primarySummaryQuarantineState(framework, 'assistant'), 'L1-B'), false);
+      const messages = (agent.getContextManager() as unknown as {
+        getAllMessages: () => Array<{ content: ContentBlock[] }>;
+      }).getAllMessages();
+      assert.equal(countMessagesContaining(messages, RETRY_OUTPUT_SENTINEL), 0);
+      assert.equal(fallbackRecords(framework).length, 0, 'fork branch must not receive fallback-family state writes');
+      assert.equal(membrane.calls.length, 2, 'the retry provider call may happen once, but must not be replayed');
+      await agent.getContextManager().switchBranch(mainBranch);
+      const mainMessages = (agent.getContextManager() as unknown as {
+        getAllMessages: () => Array<{ content: ContentBlock[] }>;
+      }).getAllMessages();
+      assert.equal(countMessagesContaining(mainMessages, RETRY_OUTPUT_SENTINEL), 0, 'source branch must not receive stale retry output');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('keeps quarantine namespace-local across agents', async () => {
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [outputResponse('agent-a retry success')],
+    ]);
+    const strategyA = new ProbeStrategy({
+      compressionModel: 'same-model',
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+    });
+    const strategyB = new ProbeStrategy({
+      compressionModel: 'same-model',
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+    });
+    const { framework, agent, strategy } = await createFrameworkFixture({
+      membrane,
+      strategy: strategyA,
+      extraAgents: [{ name: 'observer', strategy: strategyB }],
+    });
+    try {
+      const observer = framework.getAgent('observer')!;
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      seedSummary(strategyB, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      addLatestPrompt(observer, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      seedSummary(strategyB, 'L1-B', b);
+      addLatestPrompt(agent, 'current');
+      addLatestPrompt(observer, 'current');
+
+      await enqueueAndDrain(framework);
+
+      assert.ok(primarySummaryQuarantineState(framework, 'assistant'));
+      assert.equal(
+        primarySummaryQuarantineState(framework, 'observer'),
+        null,
+        'another namespace must not inherit the retry quarantine',
+      );
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  describe('crash phases', () => {
+    async function setupTextRetryScenario() {
+      const membrane = new ScriptedMembrane([
+        [refusalResponse()],
+        [outputResponse()],
+      ]);
+      const fixture = await createFrameworkFixture({ membrane });
+      const { framework, agent, strategy } = fixture;
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'current');
+      return fixture;
+    }
+
+    async function setupToolRetryScenario() {
+      const module = new EchoModule(() => true);
+      const membrane = new ScriptedMembrane([
+        [refusalResponse()],
+        [toolRoundResponse(), outputResponse()],
+      ]);
+      const fixture = await createFrameworkFixture({ membrane, modules: [module] });
+      const { framework, agent, strategy } = fixture;
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'current');
+      return { ...fixture, module };
+    }
+
+    it('holds on restart if the process crashes after the provider response is obtained', async () => {
+      const { path, framework, agent } = await setupTextRetryScenario();
+      try {
+        const manager = agent.getContextManager() as unknown as {
+          quarantinePrimarySummaryForPrimaryLane: (...args: unknown[]) => Promise<void>;
+        };
+        const original = manager.quarantinePrimarySummaryForPrimaryLane.bind(manager);
+        manager.quarantinePrimarySummaryForPrimaryLane = async (...args: unknown[]) => {
+          throw new Error('crash-before-quarantine');
+        };
+        await enqueueAndDrain(framework);
+        assert.equal(countMessagesContaining((manager as unknown as {
+          getAllMessages: () => Array<{ content: ContentBlock[] }>;
+        }).getAllMessages(), RETRY_OUTPUT_SENTINEL), 0);
+        manager.quarantinePrimarySummaryForPrimaryLane = original;
+      } finally {
+        await framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+      try {
+        assert.equal(restarted.membrane.calls.length, 0);
+        const original = latestPrimaryRecord(restarted.framework);
+        assert.equal(original.fallbackStatus, 'held');
+      } finally {
+        await restarted.framework.stop();
+      }
+    });
+
+    it('holds on restart if the process crashes after quarantine is persisted', async () => {
+      const { path, framework, agent } = await setupTextRetryScenario();
+      try {
+        const manager = agent.getContextManager() as unknown as {
+          quarantinePrimarySummaryForPrimaryLane: (...args: unknown[]) => Promise<void>;
+        };
+        const original = manager.quarantinePrimarySummaryForPrimaryLane.bind(manager);
+        manager.quarantinePrimarySummaryForPrimaryLane = async (...args: unknown[]) => {
+          await original(...args);
+          throw new Error('crash-after-quarantine');
+        };
+        await enqueueAndDrain(framework);
+        manager.quarantinePrimarySummaryForPrimaryLane = original;
+      } finally {
+        await framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+      try {
+        assert.equal(restarted.membrane.calls.length, 0);
+        assert.equal(jsonContains(primarySummaryQuarantineState(restarted.framework, 'assistant'), 'L1-B'), true);
+        const messages = (restarted.agent!.getContextManager() as unknown as {
+          getAllMessages: () => Array<{ content: ContentBlock[] }>;
+        }).getAllMessages();
+        assert.equal(countMessagesContaining(messages, RETRY_OUTPUT_SENTINEL), 0);
+      } finally {
+        await restarted.framework.stop();
+      }
+    });
+
+    it('holds on restart if the process crashes after assistant output is persisted', async () => {
+      const { path, framework, agent } = await setupTextRetryScenario();
+      try {
+        const manager = agent.getContextManager() as unknown as {
+          addMessage: (...args: unknown[]) => string;
+        };
+        const original = manager.addMessage.bind(manager);
+        manager.addMessage = (...args: unknown[]) => {
+          const messageId = original(...args);
+          if (typeof args[0] === 'string' && args[0] === agent.name && jsonContains(args[1], RETRY_OUTPUT_SENTINEL)) {
+            throw new Error('crash-after-output');
+          }
+          return messageId;
+        };
+        await enqueueAndDrain(framework);
+        manager.addMessage = original;
+      } finally {
+        await framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+      try {
+        const messages = (restarted.agent!.getContextManager() as unknown as {
+          getAllMessages: () => Array<{ content: ContentBlock[] }>;
+        }).getAllMessages();
+        assert.equal(countMessagesContaining(messages, RETRY_OUTPUT_SENTINEL), 1);
+        const original = latestPrimaryRecord(restarted.framework);
+        assert.equal(original.fallbackStatus, 'held');
+      } finally {
+        await restarted.framework.stop();
+      }
+    });
+
+    it('preserves success after a post-success crash and never resends on restart', async () => {
+      const { path, framework } = await setupTextRetryScenario();
+      try {
+        const registry = (framework as unknown as {
+          moduleRegistry: { dispatchSpeech: (...args: unknown[]) => Promise<void> };
+        }).moduleRegistry;
+        const original = registry.dispatchSpeech.bind(registry);
+        registry.dispatchSpeech = async (...args: unknown[]) => {
+          throw new Error('crash-after-success-markers');
+        };
+        await enqueueAndDrain(framework);
+        registry.dispatchSpeech = original;
+      } finally {
+        await framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+      try {
+        assert.equal(restarted.membrane.calls.length, 0);
+        const retry = fallbackRetryRecords(restarted.framework).at(-1)!;
+        const original = latestPrimaryRecord(restarted.framework);
+        assert.equal(retry.finalStatus, 'success');
+        assert.equal(original.fallbackStatus, 'success');
+      } finally {
+        await restarted.framework.stop();
+      }
+    });
+
+    it('holds without executing a tool if the process crashes before tool dispatch', async () => {
+      const { path, framework, module } = await setupToolRetryScenario();
+      try {
+        const original = (framework as unknown as {
+          dispatchToolCall: (agentName: string, call: ToolCall) => void;
+        }).dispatchToolCall.bind(framework);
+        (framework as unknown as {
+          dispatchToolCall: (agentName: string, call: ToolCall) => void;
+        }).dispatchToolCall = (_agentName: string, _call: ToolCall) => {
+          throw new Error('crash-before-tool-dispatch');
+        };
+        await enqueueAndDrain(framework);
+        assert.equal(module.calls.length, 0);
+      } finally {
+        await framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+      try {
+        assert.equal(restarted.membrane.calls.length, 0);
+        const original = latestPrimaryRecord(restarted.framework);
+        assert.equal(original.fallbackStatus, 'held');
+      } finally {
+        await restarted.framework.stop();
+      }
+    });
+
+    it('holds without executing a tool if the process crashes after the tool dispatch record is persisted', async () => {
+      const { path, framework, module } = await setupToolRetryScenario();
+      try {
+        const original = (framework as unknown as {
+          recordPrimarySummaryRetryToolDispatch: (...args: unknown[]) => Promise<void>;
+        }).recordPrimarySummaryRetryToolDispatch.bind(framework);
+        (framework as unknown as {
+          recordPrimarySummaryRetryToolDispatch: (...args: unknown[]) => Promise<void>;
+        }).recordPrimarySummaryRetryToolDispatch = async (...args: unknown[]) => {
+          await original(...args);
+          throw new Error('crash-after-tool-dispatch-record');
+        };
+        await enqueueAndDrain(framework);
+        assert.equal(module.calls.length, 0);
+      } finally {
+        await framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+      try {
+        const original = latestPrimaryRecord(restarted.framework);
+        const retry = fallbackRetryRecords(restarted.framework).at(-1)!;
+        assert.equal(restarted.membrane.calls.length, 0);
+        assert.equal(original.fallbackStatus, 'held');
+        assert.equal(jsonContains(retry, 'call-1'), false, 'retry record should only keep hashed dispatch metadata');
+      } finally {
+        await restarted.framework.stop();
+      }
+    });
+  });
+});
