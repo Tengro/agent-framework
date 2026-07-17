@@ -150,12 +150,27 @@ type PrimarySummaryFallbackStatus =
   | 'error'
   | 'timeout_unknown';
 
+interface PrimarySummaryFallbackRetryDispatch {
+  originalRequestId: string;
+  baselineRequestId: string;
+  intentId: string;
+  branch: { id: string; generation: number };
+  candidateSummaries: PrimarySummaryIdentity[];
+  originalArtifacts: ActivationCompileArtifacts;
+  originalProjectionKeys: string[];
+  expectedRetryRequestHash: string;
+  requestBudgetTokens: number;
+  originalRequestInputBoundTokens: number;
+  originalProviderInputTokens?: number;
+}
+
 interface PrimarySummaryFallbackIntentRecord {
   intentId: string;
   createdAt: number;
+  baselineRequestId: string;
   candidateSummaries: PrimarySummaryIdentity[];
   retryRequestHash: string;
-  retryInputBoundTokens: number;
+  retryCompleteBoundTokens: number;
   requestBudgetTokens: number;
 }
 
@@ -164,10 +179,13 @@ interface PrimarySummaryRequestRecord {
   agentName: string;
   namespace: string;
   timestamp: number;
+  dispatchKind: 'primary' | 'primary_summary_fallback_retry';
   branch: { id: string; name: string; generation: number };
   projection: PrimarySummaryProjection | null;
   requestInputBoundTokens: number;
+  requestCompleteBoundTokens: number;
   providerInputTokens?: number;
+  systemHash: string;
   modelConfigHash: string;
   toolContractHash: string;
   stopReason?: string;
@@ -175,12 +193,16 @@ interface PrimarySummaryRequestRecord {
   executedToolCalls: number;
   finalStatus: PrimarySummaryFallbackStatus;
   fallbackIntent?: PrimarySummaryFallbackIntentRecord;
-  fallbackStatus?: Exclude<PrimarySummaryFallbackStatus, 'pending'>;
+  fallbackStatus?: PrimarySummaryFallbackStatus;
   fallbackHeldReason?: string;
 }
 
 interface PrimarySummaryFallbackState {
   requests: PrimarySummaryRequestRecord[];
+}
+
+interface PendingInferenceRequest extends InferenceRequest {
+  primarySummaryFallbackRetry?: PrimarySummaryFallbackRetryDispatch;
 }
 
 /**
@@ -346,7 +368,7 @@ export class AgentFramework {
   private moduleRegistry: ModuleRegistry;
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
-  private pendingRequests: InferenceRequest[] = [];
+  private pendingRequests: PendingInferenceRequest[] = [];
   /**
    * Per-agent channel that triggered the agent's CURRENT inference turn, if any
    * (item-3 redux). Read by the ChannelRegistry's `activeChannelResolver` to
@@ -680,6 +702,7 @@ export class AgentFramework {
 
     // Restore persisted usage data (if any) from prior session
     framework.restoreUsageState();
+    await framework.reconcilePrimarySummaryFallbackStateOnStartup();
 
     // Create agents
     for (const agentConfig of config.agents) {
@@ -1464,9 +1487,84 @@ export class AgentFramework {
     return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
   }
 
+  private estimateStringTokens(text: string, overhead = 0): number {
+    return Math.ceil(Buffer.byteLength(text, 'utf8') / 4) + overhead;
+  }
+
+  private estimateUnknownTokens(value: unknown, overhead = 0): number {
+    return this.estimateStringTokens(JSON.stringify(value) ?? 'null', overhead);
+  }
+
   private estimateRequestInputBoundTokens(request: NormalizedRequest): number {
-    const serialized = JSON.stringify(request);
-    return Buffer.byteLength(serialized, 'utf8') + 512 + request.messages.length * 128;
+    let total = 96;
+    total += this.estimateStringTokens(request.system ?? '', 48);
+    for (const message of request.messages) {
+      total += 24;
+      total += this.estimateStringTokens(message.participant, 8);
+      if ((message as { cacheBreakpoint?: boolean }).cacheBreakpoint) total += 8;
+      for (const block of message.content) {
+        switch (block.type) {
+          case 'text':
+            total += this.estimateStringTokens(block.text, 24);
+            break;
+          case 'thinking':
+            total += this.estimateStringTokens(block.thinking, 32);
+            total += block.signature ? this.estimateStringTokens(block.signature, 8) : 0;
+            break;
+          case 'redacted_thinking':
+            total += this.estimateUnknownTokens(block, 32);
+            break;
+          default:
+            total += this.estimateUnknownTokens(block, 32);
+            break;
+        }
+      }
+    }
+    if (request.tools && request.tools.length > 0) {
+      total += 32;
+      for (const tool of request.tools) {
+        total += this.estimateUnknownTokens({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        }, 48);
+      }
+    }
+    total += this.estimateUnknownTokens(request.config, 48);
+    if (request.providerParams !== undefined) {
+      total += this.estimateUnknownTokens(request.providerParams, 32);
+    }
+    total += request.promptCaching ? 16 : 0;
+    total += request.cacheTtl ? this.estimateStringTokens(request.cacheTtl, 8) : 0;
+    total += request.assistantParticipant
+      ? this.estimateStringTokens(request.assistantParticipant, 8)
+      : 0;
+    return total;
+  }
+
+  private estimateRequestCompleteBoundTokens(request: NormalizedRequest): number {
+    const reserve = typeof request.config.maxTokens === 'number' && Number.isFinite(request.config.maxTokens)
+      ? request.config.maxTokens
+      : 0;
+    return this.estimateRequestInputBoundTokens(request) + reserve + 96;
+  }
+
+  private primarySummaryAdmissionBoundTokens(
+    originalRequestInputTokens: number,
+    expandedRequest: NormalizedRequest,
+    originalProviderInputTokens: number | undefined,
+  ): number {
+    const expandedInput = this.estimateRequestInputBoundTokens(expandedRequest);
+    const expandedComplete = this.estimateRequestCompleteBoundTokens(expandedRequest);
+    if (originalProviderInputTokens === undefined) return expandedComplete;
+    const reserve = typeof expandedRequest.config.maxTokens === 'number' && Number.isFinite(expandedRequest.config.maxTokens)
+      ? expandedRequest.config.maxTokens
+      : 0;
+    const positiveDelta = Math.max(0, expandedInput - originalRequestInputTokens);
+    return Math.max(
+      expandedComplete,
+      originalProviderInputTokens + positiveDelta + reserve + 96,
+    );
   }
 
   private readPrimarySummaryFallbackState(): PrimarySummaryFallbackState {
@@ -1491,6 +1589,43 @@ export class AgentFramework {
       return await work();
     } finally {
       release();
+    }
+  }
+
+  private async reconcilePrimarySummaryFallbackStateOnStartup(): Promise<void> {
+    const alerts: Array<{ agentName: string; requestId: string; reason: string }> = [];
+    await this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      let changed = false;
+      state.requests = state.requests.map((record) => {
+        if (record.finalStatus === 'pending') {
+          changed = true;
+          const reason = 'primary_summary_request_unresolved_on_restart';
+          alerts.push({ agentName: record.agentName, requestId: record.requestId, reason });
+          return {
+            ...record,
+            finalStatus: 'timeout_unknown',
+            fallbackHeldReason: reason,
+          };
+        }
+        if (record.fallbackIntent && record.fallbackStatus === 'pending') {
+          changed = true;
+          const reason = 'primary_summary_fallback_unresolved_on_restart';
+          alerts.push({ agentName: record.agentName, requestId: record.requestId, reason });
+          return {
+            ...record,
+            fallbackStatus: 'held',
+            fallbackHeldReason: reason,
+          };
+        }
+        return record;
+      });
+      if (changed) this.writePrimarySummaryFallbackState({ requests: state.requests.slice(-256) });
+    });
+    for (const alert of alerts) {
+      this.opsAlert('refusal-held', alert.agentName, alert.reason, {
+        data: { requestId: alert.requestId },
+      });
     }
   }
 
@@ -1544,7 +1679,9 @@ export class AgentFramework {
       if (candidate.requestId === current.requestId) continue;
       if (candidate.agentName !== current.agentName) continue;
       if (candidate.namespace !== current.namespace) continue;
+      if (candidate.branch.id !== current.branch.id) continue;
       if (candidate.branch.generation !== current.branch.generation) continue;
+      if (candidate.systemHash !== current.systemHash) continue;
       if (candidate.modelConfigHash !== current.modelConfigHash) continue;
       if (candidate.toolContractHash !== current.toolContractHash) continue;
       if (candidate.finalStatus !== 'success') continue;
@@ -1613,6 +1750,7 @@ export class AgentFramework {
   private buildPrimarySummaryRequestRecord(
     agent: Agent,
     requestId: string,
+    dispatchKind: PrimarySummaryRequestRecord['dispatchKind'],
     request: NormalizedRequest,
     artifacts: ActivationCompileArtifacts | undefined,
     branch: BranchGenerationInfo | null,
@@ -1626,14 +1764,17 @@ export class AgentFramework {
     return {
       requestId,
       agentName: agent.name,
-      namespace: `agents/${agent.name}`,
+      namespace: projection?.namespace ?? `agents/${agent.name}`,
       timestamp: Date.now(),
+      dispatchKind,
       branch: branch
         ? { id: branch.id, name: branch.name, generation: branch.generation }
         : { id: 'unknown', name: 'unknown', generation: -1 },
       projection,
       requestInputBoundTokens: this.estimateRequestInputBoundTokens(request),
+      requestCompleteBoundTokens: this.estimateRequestCompleteBoundTokens(request),
       providerInputTokens,
+      systemHash: artifacts?.contract.systemHash ?? this.hashJson(request.system ?? ''),
       modelConfigHash: artifacts?.contract.modelConfigHash ?? this.hashJson({ request: request.config }),
       toolContractHash: artifacts?.contract.toolContractHash ?? this.hashJson(request.tools ?? []),
       stopReason,
@@ -3859,7 +4000,7 @@ export class AgentFramework {
     const state = this.createFrameworkState();
 
     // Group requests by agent
-    const requestsByAgent = new Map<string, InferenceRequest[]>();
+    const requestsByAgent = new Map<string, PendingInferenceRequest[]>();
     for (const req of this.pendingRequests) {
       const existing = requestsByAgent.get(req.agentName) ?? [];
       existing.push(req);
@@ -3924,7 +4065,12 @@ export class AgentFramework {
       }
 
       // Start streaming inference (non-blocking — driveStream runs in background)
-      const trigger = requests[0];
+      const trigger = requests.find((request) => request.primarySummaryFallbackRetry) ?? requests[0]!;
+      if (trigger.primarySummaryFallbackRetry) {
+        for (const request of requests) {
+          if (request !== trigger) this.pendingRequests.push(request);
+        }
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle) — reply
@@ -3941,9 +4087,9 @@ export class AgentFramework {
     }
   }
 
-  private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
+  private async startAgentStream(agent: Agent, trigger?: PendingInferenceRequest, attempt = 0): Promise<void> {
     // Record turn checkpoint before inference (only on first attempt, not retries)
-    if (attempt === 0) {
+    if (attempt === 0 && trigger?.reason !== 'primary-summary-fallback-retry') {
       this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
@@ -3964,54 +4110,230 @@ export class AgentFramework {
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
     this.eventGate?.onInferenceStarted(agent.name);
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
+    const requestId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     try {
       const allTools = this.getAllTools();
       const tools = allTools.filter((t) => agent.canUseTool(t.name));
+      const fallbackConfig = this.primarySummaryFallbackConfig(agent);
+      const retryDispatch = trigger?.primarySummaryFallbackRetry;
+      let compiledRequest: NormalizedRequest;
+      let artifacts: ActivationCompileArtifacts;
+      let branch = agent.getCurrentBranchGeneration();
 
-      // Gather context from modules (pull-based) and MCPL hooks (push-based)
-      // Both produce ContextInjection[] that get merged before inference.
-      let injections: ContextInjection[] | undefined;
-
-      // Module gatherContext (fail-open, per-module timeout — the module's
-      // contextTimeoutMs, else the registry default). Injections are
-      // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
-      // injections below, so conversation forks don't see cross-channel
-      // content.
-      try {
-        const moduleInjections = this.scopeInjectionsForAgent(
-          agent.name,
-          await this.moduleRegistry.gatherContext(agent.name),
-        );
-        if (moduleInjections.length > 0) {
-          injections = moduleInjections;
-        }
-      } catch (error) {
-        console.error('Module gatherContext error:', error);
-      }
-
-      // MCPL beforeInference hooks (fail-open)
-      if (this.hookOrchestrator) {
-        try {
-          const hookParams = this.buildBeforeInferenceParams(agent, trigger);
-          const hookInjections = this.scopeInjectionsForAgent(
-            agent.name,
-            await this.hookOrchestrator.beforeInference(hookParams),
+      if (retryDispatch) {
+        if (!fallbackConfig.enabled) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            'primary_summary_fallback_disabled_before_retry',
           );
-          if (hookInjections.length > 0) {
-            injections = injections ? [...injections, ...hookInjections] : hookInjections;
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+        if (
+          !branch ||
+          branch.id !== retryDispatch.branch.id ||
+          branch.generation !== retryDispatch.branch.generation
+        ) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            'primary_summary_fallback_branch_changed_before_retry',
+            {
+              expectedBranchId: retryDispatch.branch.id,
+              expectedGeneration: retryDispatch.branch.generation,
+              actualBranchId: branch?.id,
+              actualGeneration: branch?.generation,
+            },
+          );
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+
+        const rebuilt = agent.buildPrimarySummaryRawExpansionRequest(
+          retryDispatch.originalArtifacts,
+          retryDispatch.candidateSummaries,
+          tools,
+        );
+        compiledRequest = rebuilt.request;
+        artifacts = rebuilt.artifacts;
+
+        const rebuiltHash = this.hashJson(compiledRequest);
+        if (
+          rebuiltHash !== retryDispatch.expectedRetryRequestHash ||
+          this.primarySummaryProjectionKeys(artifacts.compileResult.primarySummaryProjection ?? null).join('\u0000') !==
+            retryDispatch.originalProjectionKeys.join('\u0000')
+        ) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            'primary_summary_fallback_revalidation_failed_before_retry',
+            {
+              expectedRetryRequestHash: retryDispatch.expectedRetryRequestHash,
+              actualRetryRequestHash: rebuiltHash,
+            },
+          );
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+
+        const retryRecord = this.buildPrimarySummaryRequestRecord(
+          agent,
+          requestId,
+          'primary_summary_fallback_retry',
+          compiledRequest,
+          artifacts,
+          branch,
+          undefined,
+          false,
+          0,
+          undefined,
+          'pending',
+        );
+        await this.persistPrimarySummaryRequestRecord(retryRecord);
+
+        const admittedTokens = this.primarySummaryAdmissionBoundTokens(
+          retryDispatch.originalRequestInputBoundTokens,
+          compiledRequest,
+          retryDispatch.originalProviderInputTokens,
+        );
+        if (admittedTokens > retryDispatch.requestBudgetTokens) {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            requestId,
+            'primary_summary_fallback_retry_over_budget',
+            {
+              admittedTokens,
+              requestBudgetTokens: retryDispatch.requestBudgetTokens,
+              retryRequestHash: rebuiltHash,
+            },
+          );
+          await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => ({
+            ...record,
+            fallbackStatus: 'held',
+            fallbackHeldReason: 'primary_summary_fallback_retry_over_budget',
+          }));
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+      } else {
+        // Gather context from modules (pull-based) and MCPL hooks (push-based)
+        // Both produce ContextInjection[] that get merged before inference.
+        let injections: ContextInjection[] | undefined;
+
+        // Module gatherContext (fail-open, per-module timeout — the module's
+        // contextTimeoutMs, else the registry default). Injections are
+        // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
+        // injections below, so conversation forks don't see cross-channel
+        // content.
+        try {
+          const moduleInjections = this.scopeInjectionsForAgent(
+            agent.name,
+            await this.moduleRegistry.gatherContext(agent.name),
+          );
+          if (moduleInjections.length > 0) {
+            injections = moduleInjections;
           }
         } catch (error) {
-          console.error('beforeInference hook error:', error);
+          console.error('Module gatherContext error:', error);
+        }
+
+        // MCPL beforeInference hooks (fail-open)
+        if (this.hookOrchestrator) {
+          try {
+            const hookParams = this.buildBeforeInferenceParams(agent, trigger);
+            const hookInjections = this.scopeInjectionsForAgent(
+              agent.name,
+              await this.hookOrchestrator.beforeInference(hookParams),
+            );
+            if (hookInjections.length > 0) {
+              injections = injections ? [...injections, ...hookInjections] : hookInjections;
+            }
+          } catch (error) {
+            console.error('beforeInference hook error:', error);
+          }
+        }
+
+        const prepared = await agent.prepareActivationRequest(tools, injections);
+        compiledRequest = prepared.request;
+        artifacts = prepared.artifacts;
+        branch = agent.getCurrentBranchGeneration();
+
+        if (fallbackConfig.enabled) {
+          const record = this.buildPrimarySummaryRequestRecord(
+            agent,
+            requestId,
+            'primary',
+            compiledRequest,
+            artifacts,
+            branch,
+            undefined,
+            false,
+            0,
+            undefined,
+            'pending',
+          );
+          await this.persistPrimarySummaryRequestRecord(record);
+          const expandedByQuarantine =
+            artifacts.compileResult.primarySummaryProjection?.selectedSummaries.some(
+              (selection) => selection.renderedAs === 'raw_expansion',
+            ) ?? false;
+          if (expandedByQuarantine) {
+            const admittedTokens = this.estimateRequestCompleteBoundTokens(compiledRequest);
+            if (admittedTokens > fallbackConfig.requestBudgetTokens) {
+              await this.holdPrimarySummaryRequest(
+                agent,
+                requestId,
+                'primary_summary_quarantine_over_budget',
+                {
+                  admittedTokens,
+                  requestBudgetTokens: fallbackConfig.requestBudgetTokens,
+                },
+              );
+              agent.reset();
+              this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+              this.eventGate?.onInferenceEnded(agent.name);
+              this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+              return;
+            }
+          }
         }
       }
 
-      const { stream, request: compiledRequest, artifacts } = await agent.startStreamWithInjections(tools, injections);
-
-      const handle = this.driveStream(agent, stream, trigger, attempt, compiledRequest, artifacts);
+      const { stream } = agent.startStreamFromRequest(compiledRequest, artifacts);
+      const handle = this.driveStream(agent, stream, requestId, trigger, attempt, compiledRequest, artifacts);
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
+      if (trigger?.primarySummaryFallbackRetry) {
+        await this.updatePrimarySummaryRequestRecord(trigger.primarySummaryFallbackRetry.originalRequestId, (record) => ({
+          ...record,
+          fallbackStatus: 'held',
+          fallbackHeldReason: err.message,
+        }));
+        this.opsAlert('refusal-held', agent.name, err.message);
+        agent.reset();
+        this.settleAgent(agent.name, {
+          stopReason: 'completed',
+          speech: '',
+        });
+        this.eventGate?.onInferenceEnded(agent.name);
+        this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+        return;
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -4054,16 +4376,19 @@ export class AgentFramework {
   private async driveStream(
     agent: Agent,
     stream: YieldingStream,
-    trigger?: InferenceRequest,
+    requestId: string,
+    trigger?: PendingInferenceRequest,
     attempt = 0,
     compiledRequest?: NormalizedRequest,
     artifacts?: ActivationCompileArtifacts,
   ): Promise<void> {
     const startTime = Date.now();
-    const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
     let hadToolCalls = false;
     let executedToolCalls = 0;
+    const primarySummaryConfig = this.primarySummaryFallbackConfig(agent);
+    const primarySummaryRetry = trigger?.primarySummaryFallbackRetry;
+    let primarySummaryQuarantinePersisted = false;
 
     // ---- Present-while-acting turn state ---------------------------------
     // Output locus for the current CONVERSATIONAL ROUND: resolved lazily and
@@ -4144,6 +4469,37 @@ export class AgentFramework {
       }
     };
 
+    const persistPrimarySummaryRetryQuarantine = async (): Promise<boolean> => {
+      if (!primarySummaryRetry || primarySummaryQuarantinePersisted || !artifacts) return true;
+      try {
+        await agent.getContextManager().quarantinePrimarySummaryForPrimaryLane(
+          artifacts.contract,
+          primarySummaryRetry.candidateSummaries,
+        );
+        primarySummaryQuarantinePersisted = true;
+        await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+          ...record,
+          fallbackStatus: 'success',
+          fallbackHeldReason: undefined,
+        }));
+        return true;
+      } catch (error) {
+        const reason = 'primary_summary_fallback_quarantine_failed';
+        await this.holdPrimarySummaryRequest(agent, requestId, reason, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+          ...record,
+          fallbackStatus: 'held',
+          fallbackHeldReason: reason,
+        }));
+        stream.cancel();
+        agent.reset();
+        this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+        return false;
+      }
+    };
+
     try {
       for await (const event of stream) {
         this.touchEphemeralRun(agent.name, true);
@@ -4173,8 +4529,6 @@ export class AgentFramework {
           case 'tool-calls': {
             adoptInjectedRound();
             hadToolCalls = true;
-            executedToolCalls += event.calls.length;
-            this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
               agentName: agent.name,
@@ -4212,6 +4566,13 @@ export class AgentFramework {
             // So all calls here have valid input — {} is legitimate for parameterless tools.
 
             agent.enterWaitingForTools(event.calls, stream);
+
+            if (!(await persistPrimarySummaryRetryQuarantine())) {
+              return;
+            }
+
+            executedToolCalls += event.calls.length;
+            this.recordEphemeralToolCalls(agent.name, event.calls.length);
 
             for (const call of event.calls) {
               this.dispatchToolCall(agent.name, call);
@@ -4299,14 +4660,6 @@ export class AgentFramework {
               }
             }
 
-            // Add assistant response to context.
-            // If we had tool calls, each round's blocks (thinking + text +
-            // tool_use) were already stored as pendingAssistantBlocks and
-            // flushed when tool results arrived. Only store TRAILING content
-            // — blocks after the last tool block. A type-based filter would
-            // double-store earlier rounds' text/thinking AND detach signed
-            // thinking blocks from their tool_use turn (the API requires
-            // thinking to precede tool_use in the same assistant turn).
             const lastToolIdx = response.content.reduce(
               (last: number, b: ContentBlock, i: number) =>
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
@@ -4315,6 +4668,187 @@ export class AgentFramework {
             const terminalContent = lastToolIdx >= 0
               ? response.content.slice(lastToolIdx + 1)
               : response.content;
+            const visibleAssistantOutput = this.hasVisibleAssistantOutput(response.content);
+            const providerInputTokens =
+              response.usage?.inputTokens ??
+              response.details?.usage?.inputTokens;
+
+            if (primarySummaryConfig.enabled && compiledRequest && artifacts && response.stopReason === 'refusal') {
+              const stopDetails = (response.raw?.response as {
+                stop_details?: { category?: string; explanation?: string };
+              } | undefined)?.stop_details;
+              const category = stopDetails?.category ?? 'unknown';
+              console.error(
+                `[inference-refusal] agent=${agent.name} category=${category}` +
+                  (stopDetails?.explanation ? ` explanation=${stopDetails.explanation}` : ''),
+              );
+              this.noteRefusal(agent.name, category, response.details?.usage
+                ? {
+                    input: response.details.usage.inputTokens,
+                    output: response.details.usage.outputTokens,
+                  }
+                : undefined);
+
+              const currentRecord = await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                ...record,
+                stopReason: response.stopReason,
+                providerInputTokens,
+                visibleAssistantOutput,
+                executedToolCalls,
+                finalStatus: 'refusal',
+              }));
+
+              const holdReasonData = {
+                category,
+                visibleAssistantOutput,
+                executedToolCalls,
+                candidateLimit: primarySummaryConfig.maxNewSummaries,
+              };
+
+              if (primarySummaryRetry) {
+                const reason = visibleAssistantOutput
+                  ? 'primary_summary_fallback_retry_partial_output'
+                  : executedToolCalls > 0
+                    ? 'primary_summary_fallback_retry_tool_already_executed'
+                    : 'primary_summary_fallback_retry_refusal';
+                await this.holdPrimarySummaryRequest(agent, requestId, reason, holdReasonData);
+                await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+                  ...record,
+                  fallbackStatus: 'held',
+                  fallbackHeldReason: reason,
+                }));
+              } else if (visibleAssistantOutput || executedToolCalls > 0 || !currentRecord?.projection) {
+                const reason = visibleAssistantOutput
+                  ? 'primary_summary_refusal_partial_output'
+                  : executedToolCalls > 0
+                    ? 'primary_summary_refusal_tool_already_executed'
+                    : 'primary_summary_refusal_no_projection';
+                await this.holdPrimarySummaryRequest(agent, requestId, reason, holdReasonData);
+              } else {
+                const state = this.readPrimarySummaryFallbackState();
+                const baseline = this.latestCompatibleHealthyPrimaryRequest(currentRecord, state);
+                if (!baseline?.projection) {
+                  await this.holdPrimarySummaryRequest(
+                    agent,
+                    requestId,
+                    'primary_summary_refusal_no_compatible_healthy_baseline',
+                    holdReasonData,
+                  );
+                } else {
+                  const baselineKeys = new Set(this.primarySummaryProjectionKeys(baseline.projection));
+                  const candidates = currentRecord.projection.selectedSummaries
+                    .filter((selection) => !baselineKeys.has(this.primarySummaryIdentityKey(selection.identity)))
+                    .map((selection) => selection.identity);
+                  if (candidates.length === 0) {
+                    await this.holdPrimarySummaryRequest(
+                      agent,
+                      requestId,
+                      'primary_summary_refusal_no_newly_admitted_candidates',
+                      holdReasonData,
+                    );
+                  } else if (candidates.length > primarySummaryConfig.maxNewSummaries) {
+                    await this.holdPrimarySummaryRequest(
+                      agent,
+                      requestId,
+                      'primary_summary_refusal_too_many_candidates',
+                      { ...holdReasonData, candidateCount: candidates.length },
+                    );
+                  } else {
+                    try {
+                      const retry = agent.buildPrimarySummaryRawExpansionRequest(
+                        artifacts,
+                        candidates,
+                        compiledRequest.tools ?? [],
+                      );
+                      const retryRequestHash = this.hashJson(retry.request);
+                      const admittedTokens = this.primarySummaryAdmissionBoundTokens(
+                        currentRecord.requestInputBoundTokens,
+                        retry.request,
+                        providerInputTokens,
+                      );
+                      if (admittedTokens > primarySummaryConfig.requestBudgetTokens) {
+                        await this.holdPrimarySummaryRequest(
+                          agent,
+                          requestId,
+                          'primary_summary_refusal_retry_over_budget',
+                          {
+                            ...holdReasonData,
+                            admittedTokens,
+                            requestBudgetTokens: primarySummaryConfig.requestBudgetTokens,
+                          },
+                        );
+                      } else {
+                        const intentId = `${requestId}:fallback:${Math.random().toString(36).slice(2, 8)}`;
+                        await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                          ...record,
+                          fallbackIntent: {
+                            intentId,
+                            createdAt: Date.now(),
+                            baselineRequestId: baseline.requestId,
+                            candidateSummaries: candidates,
+                            retryRequestHash,
+                            retryCompleteBoundTokens: admittedTokens,
+                            requestBudgetTokens: primarySummaryConfig.requestBudgetTokens,
+                          },
+                          fallbackStatus: 'pending',
+                        }));
+                        this.pendingRequests.push({
+                          agentName: agent.name,
+                          reason: 'primary-summary-fallback-retry',
+                          source: 'framework',
+                          timestamp: Date.now(),
+                          channelId: trigger?.channelId,
+                          primarySummaryFallbackRetry: {
+                            originalRequestId: requestId,
+                            baselineRequestId: baseline.requestId,
+                            intentId,
+                            branch: {
+                              id: currentRecord.branch.id,
+                              generation: currentRecord.branch.generation,
+                            },
+                            candidateSummaries: candidates,
+                            originalArtifacts: artifacts,
+                            originalProjectionKeys: this.primarySummaryProjectionKeys(currentRecord.projection),
+                            expectedRetryRequestHash: retryRequestHash,
+                            requestBudgetTokens: primarySummaryConfig.requestBudgetTokens,
+                            originalRequestInputBoundTokens: currentRecord.requestInputBoundTokens,
+                            originalProviderInputTokens: providerInputTokens,
+                          },
+                        });
+                      }
+                    } catch (error) {
+                      await this.holdPrimarySummaryRequest(
+                        agent,
+                        requestId,
+                        'primary_summary_refusal_retry_build_failed',
+                        {
+                          ...holdReasonData,
+                          error: error instanceof Error ? error.message : String(error),
+                        },
+                      );
+                    }
+                  }
+                }
+              }
+
+              agent.reset();
+              this.eventGate?.onInferenceEnded(agent.name);
+              this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+              continue;
+            }
+
+            if (!(await persistPrimarySummaryRetryQuarantine())) {
+              return;
+            }
+
+            // Add assistant response to context.
+            // If we had tool calls, each round's blocks (thinking + text +
+            // tool_use) were already stored as pendingAssistantBlocks and
+            // flushed when tool results arrived. Only store TRAILING content
+            // — blocks after the last tool block. A type-based filter would
+            // double-store earlier rounds' text/thinking AND detach signed
+            // thinking blocks from their tool_use turn (the API requires
+            // thinking to precede tool_use in the same assistant turn).
             if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
                 agent.addAssistantResponse(terminalContent);
@@ -4381,6 +4915,24 @@ export class AgentFramework {
                   cacheRead: du.cacheReadTokens,
                 }
               : undefined;
+
+            if (primarySummaryConfig.enabled) {
+              await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                ...record,
+                stopReason: response.stopReason,
+                providerInputTokens,
+                visibleAssistantOutput,
+                executedToolCalls,
+                finalStatus: 'success',
+              }));
+              if (primarySummaryRetry) {
+                await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+                  ...record,
+                  fallbackStatus: 'success',
+                  fallbackHeldReason: undefined,
+                }));
+              }
+            }
 
             // Reset agent state before emitting inference:completed. Traces are
             // observability-only, but external synchronous listeners should
@@ -4689,6 +5241,23 @@ export class AgentFramework {
             // reject an ephemeral's promise mid-run and bump the failure
             // streak). Gate release + stream teardown happen in `finally`.
             if (this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`)) {
+              if (primarySummaryRetry && !primarySummaryQuarantinePersisted) {
+                await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                  ...record,
+                  finalStatus: 'timeout_unknown',
+                  fallbackHeldReason: 'primary_summary_fallback_retry_cancelled_before_success',
+                }));
+                await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+                  ...record,
+                  fallbackStatus: 'timeout_unknown',
+                  fallbackHeldReason: 'primary_summary_fallback_retry_cancelled_before_success',
+                }));
+                this.opsAlert(
+                  'refusal-held',
+                  agent.name,
+                  'primary_summary_fallback_retry_cancelled_before_success',
+                );
+              }
               this.eventGate?.onInferenceEnded(agent.name);
               return;
             }
@@ -4697,6 +5266,24 @@ export class AgentFramework {
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
               const durationMs = Date.now() - startTime;
+              if (primarySummaryConfig.enabled) {
+                await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+                  ...record,
+                  stopReason: 'abort',
+                  finalStatus: primarySummaryRetry && !primarySummaryQuarantinePersisted
+                    ? 'timeout_unknown'
+                    : 'error',
+                  fallbackHeldReason: `stream_aborted:${reason}`,
+                }));
+                if (primarySummaryRetry && !primarySummaryQuarantinePersisted) {
+                  await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+                    ...record,
+                    fallbackStatus: 'timeout_unknown',
+                    fallbackHeldReason: `stream_aborted:${reason}`,
+                  }));
+                  this.opsAlert('refusal-held', agent.name, `stream_aborted:${reason}`);
+                }
+              }
               agent.reset();
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
@@ -4772,6 +5359,23 @@ export class AgentFramework {
       // inference:exhausted so ephemeral agent promises can settle.
       const err = error instanceof Error ? error : new Error(String(error));
       const durationMs = Date.now() - startTime;
+      if (primarySummaryConfig.enabled) {
+        await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+          ...record,
+          finalStatus: primarySummaryRetry && !primarySummaryQuarantinePersisted
+            ? 'timeout_unknown'
+            : 'error',
+          fallbackHeldReason: err.message,
+        }));
+        if (primarySummaryRetry && !primarySummaryQuarantinePersisted) {
+          await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+            ...record,
+            fallbackStatus: 'timeout_unknown',
+            fallbackHeldReason: err.message,
+          }));
+          this.opsAlert('refusal-held', agent.name, err.message);
+        }
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -5306,12 +5910,23 @@ export class AgentFramework {
    * work, per-agent status + last inference activity. Cheap and read-only.
    */
   healthSnapshot(): Record<string, unknown> {
+    const primarySummary = this.readPrimarySummaryFallbackState();
     return {
       at: new Date().toISOString(),
       uptimeSec: Math.round(process.uptime()),
       gate: this.eventGate?.inferenceDiagnostics() ?? null,
       pendingRequests: this.pendingRequests.length,
       activeStreams: [...this.activeStreams.keys()],
+      primarySummaryFallback: {
+        requests: primarySummary.requests.length,
+        pendingDispatches: primarySummary.requests.filter((record) => record.finalStatus === 'pending').length,
+        unresolvedIntents: primarySummary.requests.filter((record) => record.fallbackStatus === 'pending').length,
+        held: primarySummary.requests.filter((record) =>
+          record.finalStatus === 'held' ||
+          record.finalStatus === 'timeout_unknown' ||
+          record.fallbackStatus === 'held' ||
+          record.fallbackStatus === 'timeout_unknown').length,
+      },
       agents: [...this.agents.entries()].map(([name, agent]) => ({
         name,
         status: agent.state.status,

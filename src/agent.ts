@@ -5,9 +5,8 @@ import { toolResultDataToHistoryString } from './tool-result-history.js';
 
 export interface ActivationCompileArtifacts {
   compileResult: CompileResult;
-  contract: {
-    modelConfigHash: string;
-    toolContractHash: string;
+  contract: PrimarySummaryContract & {
+    systemHash: string;
   };
 }
 
@@ -43,6 +42,10 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentRuntimeSettingsOverrides,
 } from './types/index.js';
+
+type PrimarySummaryContractWithSystemHash = PrimarySummaryContract & {
+  systemHash: string;
+};
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
@@ -208,19 +211,21 @@ export class Agent {
     return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
   }
 
-  private buildPrimarySummaryContract(tools: ToolDefinition[]): PrimarySummaryContract {
+  private primarySummaryFallbackEnabled(): boolean {
+    return this.refusalHandling?.primarySummaryFallback?.enabled === true;
+  }
+
+  private buildPrimarySummaryContractForRequest(request: NormalizedRequest): PrimarySummaryContractWithSystemHash {
     return {
+      systemHash: this.hashJson(request.system ?? ''),
       modelConfigHash: this.hashJson({
-        model: this.model,
-        maxTokens: this.maxTokens,
-        temperature: this.temperature,
-        thinking: this.thinking,
-        providerParams: this.providerParams,
-        promptCaching: true,
-        cacheTtl: this.cacheTtl,
-        assistantParticipant: this.name,
+        requestConfig: request.config,
+        providerParams: request.providerParams,
+        promptCaching: request.promptCaching,
+        cacheTtl: request.cacheTtl,
+        assistantParticipant: request.assistantParticipant,
       }),
-      toolContractHash: this.hashJson(tools),
+      toolContractHash: this.hashJson(request.tools ?? []),
     };
   }
 
@@ -297,7 +302,7 @@ export class Agent {
     };
   }
 
-  private async buildActivationRequestArtifacts(
+  async prepareActivationRequest(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
@@ -305,20 +310,22 @@ export class Agent {
     (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
       .setToolDefinitions?.(availableTools);
 
-    const contract = this.buildPrimarySummaryContract(availableTools);
+    let compileResult = await this.compileWithInjections(budget, injections);
+    let request = this.buildRequestFromCompileResult(compileResult, availableTools);
+    const contract = this.buildPrimarySummaryContractForRequest(request);
     this.setPrimaryLaneContract(contract);
 
-    let compileResult = await this.compileWithInjections(budget, injections);
     const projection = compileResult.primarySummaryProjection;
-    if (projection) {
+    if (this.primarySummaryFallbackEnabled() && projection) {
       const quarantined = this.matchingPrimarySummaryQuarantine(projection, contract);
       if (quarantined.length > 0) {
         compileResult = this.expandPrimarySummaryProjectionRaw(compileResult, quarantined);
+        request = this.buildRequestFromCompileResult(compileResult, availableTools);
       }
     }
 
     return {
-      request: this.buildRequestFromCompileResult(compileResult, availableTools),
+      request,
       artifacts: {
         compileResult,
         contract,
@@ -719,7 +726,7 @@ export class Agent {
     injections?: ContextInjection[],
     budget?: TokenBudget
   ): Promise<NormalizedRequest> {
-    const { request } = await this.buildActivationRequestArtifacts(availableTools, injections, budget);
+    const { request } = await this.prepareActivationRequest(availableTools, injections, budget);
     return request;
   }
 
@@ -740,7 +747,7 @@ export class Agent {
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
 
-    const { request, artifacts } = await this.buildActivationRequestArtifacts(
+    const { request, artifacts } = await this.prepareActivationRequest(
       availableTools,
       injections,
       budget,
@@ -766,6 +773,7 @@ export class Agent {
     this._streamId++;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
+    this.setPrimaryLaneContract(artifacts.contract);
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
       emitBlocks: false,
