@@ -228,10 +228,10 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
     name: 'think',
     description:
       'Reason privately. The content stays in your own context and is NOT sent to any ' +
-      'channel or surface. This does NOT end or silence your turn: if you also write ' +
-      'plain text this turn, that text is still posted as your reply. Use think() purely ' +
-      'to work things out before (or instead of) speaking. To deliberately NOT reply this ' +
-      'turn, call skip_reply instead.',
+      'channel or surface. Same-round routing of ordinary text beside think() depends on ' +
+      'your current same_round_think_text_policy; inspect or change it with agent_settings. ' +
+      'Use think() purely to work things out before (or instead of) speaking. To deliberately ' +
+      'NOT reply this turn, call skip_reply instead.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1409,8 +1409,9 @@ export class ChannelRegistry {
       data: {
         noted: true,
         note:
-          'Thought recorded (private — not sent anywhere). This did NOT silence your turn: ' +
-          'write plain text to reply, or call skip_reply to end the turn without replying.',
+          'Thought recorded (private — not sent anywhere). Same-round text routing depends on ' +
+          'your current same_round_think_text_policy; use agent_settings get to inspect it, or ' +
+          'call skip_reply to end the turn without replying.',
       },
     };
   }

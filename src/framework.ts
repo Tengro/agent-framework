@@ -73,8 +73,8 @@ import { splitProseSegments } from './prose-segments.js';
  *   - explicit delivery tools (channel_publish / *send_message /
  *     *reply_message / *send_dm) — already sent the message, so routing the
  *     prose again would double-post.
- * `think` is deliberately NOT here: it is silent *reasoning*, but prose
- * written around a think is the agent's actual voice and must be delivered.
+ * `think` is deliberately NOT here: it is silent *reasoning*, and same-round
+ * prose beside it is governed separately by same_round_think_text_policy.
  *
  * Scope: an explicit delivery suppresses prose from that round onward until
  * another external message is injected. The suppression prevents a
@@ -888,10 +888,9 @@ export class AgentFramework {
   }
 
   private async runQueuedMaintenance(): Promise<void> {
-    const allTools = this.getAllTools();
     const queued = [...this.agents.values()].flatMap((agent) => {
       const cm = agent.getContextManager();
-      const tools = allTools.filter((tool) => agent.canUseTool(tool.name));
+      const tools = this.getToolsForAgent(agent.name).filter((tool) => agent.canUseTool(tool.name));
       cm.setToolDefinitions(tools);
       if (cm.isReady()) return [];
       const pending = cm.getPendingWork()?.description;
@@ -1113,6 +1112,7 @@ export class AgentFramework {
     'context_budget_tokens',
     'tail_tokens',
     'transition_pace_tokens',
+    'same_round_think_text_policy',
   ];
 
   /**
@@ -1138,6 +1138,31 @@ export class AgentFramework {
       result.set(module.name, ext);
     }
     return result;
+  }
+
+  private buildThinkTool(agentName: string): import('./types/index.js').ToolDefinition {
+    const policy = this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy;
+    return {
+      name: 'think',
+      description:
+        'Reason privately. The think({content}) argument stays in your own context and is NOT sent ' +
+        'to channels or other surfaces. ' +
+        (policy === 'private'
+          ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
+          : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
+        ) +
+        ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy. To deliberately not reply this turn, call skip_reply instead.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          content: {
+            type: 'string',
+            description: 'Your private thought / reasoning (optional; not sent anywhere).',
+          },
+        },
+        required: [],
+      },
+    };
   }
 
   /** agent_settings tool definition with module extension fields merged in. */
@@ -1177,6 +1202,13 @@ export class AgentFramework {
         },
       } as unknown as import('./types/index.js').ToolDefinition['inputSchema'],
     };
+  }
+
+  private getToolsForAgent(agentName: string): import('./types/index.js').ToolDefinition[] {
+    return this.getAllTools().map((tool) => {
+      if (tool.name === 'think') return this.buildThinkTool(agentName);
+      return tool;
+    });
   }
 
   getAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsSnapshot {
@@ -1271,7 +1303,7 @@ export class AgentFramework {
       throw new Error(`Agent not found: ${agentName}`);
     }
 
-    const tools = this.getAllTools().filter((t) => agent.canUseTool(t.name));
+    const tools = this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name));
 
     // Default: no dynamic injection gathering → fully transparent (no
     // inference, no Chronicle writes, no external RPC). Opt in explicitly.
@@ -1817,7 +1849,7 @@ export class AgentFramework {
     name: 'agent_settings',
     description:
       'Read or change your hot runtime settings. This intentionally exposes only ' +
-      'context budget, recent raw tail size, and transition pace; model, prompts, ' +
+      'context budget, recent raw tail size, transition pace, and same-round think text routing; model, prompts, ' +
       'folding strategy, and other restart-bound configuration are not mutable here. ' +
       'Lower context budgets converge gradually under the transition pace before ' +
       'becoming the hard live limit; increases take effect immediately.',
@@ -1828,9 +1860,16 @@ export class AgentFramework {
         context_budget_tokens: { type: 'number', description: 'Total input context budget, including the reserved response allowance.' },
         tail_tokens: { type: 'number', description: 'Recent raw context retained verbatim.' },
         transition_pace_tokens: { type: 'number', description: 'Maximum ordinary KV re-read/perturbation per compile while converging.' },
+        same_round_think_text_policy: {
+          type: 'string',
+          enum: ['public', 'private'],
+          description:
+            'Routing policy for ordinary text emitted in the same native assistant round as think(). ' +
+            "Omitted in the recipe preserves the compatibility carry-forward: public.",
+        },
         settings: {
           type: 'array',
-          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens'] },
+          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy'] },
           description: 'For reset: settings to restore to recipe values. Omit to reset all.',
         },
       },
@@ -3845,7 +3884,7 @@ export class AgentFramework {
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
     try {
-      const allTools = this.getAllTools();
+      const allTools = this.getToolsForAgent(agent.name);
       const tools = allTools.filter((t) => agent.canUseTool(t.name));
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
@@ -4106,6 +4145,9 @@ export class AgentFramework {
             // note above — the fallback preamble is cumulative in XML mode).
             if (this.channelRegistry) {
               const roundToolNames = event.calls.map((c) => c.name);
+              const hasSameRoundPrivateThink =
+                roundToolNames.some((n) => bareToolName(n) === 'think') &&
+                agent.getEffectiveSameRoundThinkTextPolicy() === 'private';
               if (roundToolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)))) {
                 turnSilenced = true;
               }
@@ -4116,6 +4158,10 @@ export class AgentFramework {
                   if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
+                    );
+                  } else if (hasSameRoundPrivateThink) {
+                    console.error(
+                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
                     );
                   } else {
                     const locus = resolveTurnLocus();
@@ -6841,6 +6887,7 @@ export class AgentFramework {
         context_budget_tokens?: unknown;
         tail_tokens?: unknown;
         transition_pace_tokens?: unknown;
+        same_round_think_text_policy?: unknown;
         settings?: unknown;
       } & Record<string, unknown>;
       const extensions = this.collectAgentSettingsExtensions();
@@ -6868,6 +6915,9 @@ export class AgentFramework {
           if (input.tail_tokens !== undefined) patch.tailTokens = Number(input.tail_tokens);
           if (input.transition_pace_tokens !== undefined) {
             patch.transitionPaceTokens = Number(input.transition_pace_tokens);
+          }
+          if (input.same_round_think_text_policy !== undefined) {
+            patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
           // Route extension-owned keys to their modules; apply the core patch
           // only when it touches core keys (an extension-only update must not
@@ -6898,6 +6948,7 @@ export class AgentFramework {
               context_budget_tokens: 'contextBudgetTokens',
               tail_tokens: 'tailTokens',
               transition_pace_tokens: 'transitionPaceTokens',
+              same_round_think_text_policy: 'sameRoundThinkTextPolicy',
             };
             keys = [];
             for (const name of input.settings) {
