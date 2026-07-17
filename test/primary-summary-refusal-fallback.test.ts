@@ -180,6 +180,16 @@ function fallbackState(framework: AgentFramework): { requests: Array<Record<stri
     : { requests: [] };
 }
 
+function countMessagesContaining(
+  agent: NonNullable<ReturnType<AgentFramework['getAgent']>>,
+  needle: string,
+): number {
+  const messages = (agent.getContextManager() as unknown as {
+    getAllMessages: () => Array<{ content: ContentBlock[] }>;
+  }).getAllMessages();
+  return messages.filter((message) => JSON.stringify(message.content).includes(needle)).length;
+}
+
 async function persistHealthyBaseline(
   framework: AgentFramework,
   agent: ReturnType<AgentFramework['getAgent']>,
@@ -337,6 +347,111 @@ describe('primary summary refusal fallback', () => {
       const original = records.find((record) => record.requestId !== 'baseline-request')!;
       assert.equal(original.fallbackStatus, 'success');
       assert.equal(records.filter((record) => record.dispatchKind === 'primary_summary_fallback_retry').length, 1);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists initial refusal partial text once, holds, and never retries', async () => {
+    const refusalText = 'initial refusal partial output';
+    const membrane = new ScriptedMembrane([[refusalResponse([{ type: 'text', text: refusalText } as ContentBlock])]]);
+    const { dir, framework, agent } = await createFramework(membrane, {
+      primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
+    });
+    try {
+      const currentRequest = request('system', 'latest input');
+      const currentArtifacts = artifacts('shared', ['L1-1']);
+      (agent as unknown as {
+        prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+        getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+      }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+      (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+        () => branchInfo();
+
+      await (framework as unknown as {
+        startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+      }).startAgentStream(agent, {
+        agentName: 'assistant',
+        reason: 'test',
+        source: 'test',
+        timestamp: Date.now(),
+      });
+      await waitForStream(framework, 'assistant');
+
+      assert.equal(membrane.calls.length, 1);
+      assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
+      assert.equal(countMessagesContaining(agent, refusalText), 1);
+      const record = fallbackState(framework).requests[0]!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists retry refusal partial text once, holds, and stops at two provider calls', async () => {
+    const refusalText = 'retry refusal partial output';
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [refusalResponse([{ type: 'text', text: refusalText } as ContentBlock])],
+    ]);
+    const { dir, framework, agent } = await createFramework(membrane, {
+      primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
+    });
+    try {
+      const baselineRequest = request('system', 'baseline');
+      const baselineArtifacts = artifacts('shared', ['L1-1']);
+      await persistHealthyBaseline(framework, agent, baselineRequest, baselineArtifacts);
+
+      const currentRequest = request('system', 'latest input');
+      const currentArtifacts = artifacts('shared', ['L1-1', 'L1-2']);
+      const retryRequest = request('system', 'expanded raw source');
+      (agent as unknown as {
+        prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+        buildPrimarySummaryRawExpansionRequest: (
+          artifacts: typeof currentArtifacts,
+          summaries: ReadonlyArray<PrimarySummaryIdentity>,
+        ) => { request: NormalizedRequest; artifacts: typeof currentArtifacts };
+        getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+      }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+      (agent as unknown as {
+        buildPrimarySummaryRawExpansionRequest: (
+          artifacts: typeof currentArtifacts,
+          summaries: ReadonlyArray<PrimarySummaryIdentity>,
+        ) => { request: NormalizedRequest; artifacts: typeof currentArtifacts };
+      }).buildPrimarySummaryRawExpansionRequest = () => ({ request: retryRequest, artifacts: currentArtifacts });
+      (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+        () => branchInfo();
+
+      const start = (framework as unknown as {
+        startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+        pendingRequests: Array<Record<string, unknown>>;
+      }).startAgentStream.bind(framework);
+      await start(agent, {
+        agentName: 'assistant',
+        reason: 'test',
+        source: 'test',
+        timestamp: Date.now(),
+      });
+      await waitForStream(framework, 'assistant');
+
+      const queuedRetry = (framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests.shift();
+      assert.ok(queuedRetry);
+      await start(agent, queuedRetry!);
+      await waitForStream(framework, 'assistant');
+
+      assert.equal(membrane.calls.length, 2);
+      assert.equal((framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests.length, 0);
+      assert.equal(countMessagesContaining(agent, refusalText), 1);
+      const records = fallbackState(framework).requests;
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.fallbackStatus, 'held');
+      assert.equal(original.fallbackHeldReason, 'primary_summary_fallback_retry_partial_output');
+      assert.equal(retry.finalStatus, 'held');
+      assert.equal(retry.fallbackHeldReason, 'primary_summary_fallback_retry_partial_output');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

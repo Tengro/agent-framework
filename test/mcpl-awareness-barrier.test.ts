@@ -9,15 +9,24 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import type {
+  ContentBlock,
+  NormalizedRequest,
+  NormalizedResponse,
+  StreamEvent,
+  YieldingStream,
+} from '@animalabs/membrane';
+import type { PrimarySummaryIdentity, PrimarySummaryProjection } from '@animalabs/context-manager';
 
 import { AgentFramework } from '../src/framework.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/awareness-barrier-mcpl-server.mjs', import.meta.url));
 const TEST_ROOT = join(process.cwd(), '.test-tmp');
+const FALLBACK_STATE_ID = 'framework/primary-summary-fallback';
 
 interface StatusRecord {
   event: string;
@@ -145,6 +154,167 @@ function twoServerFrameworkConfig(
   };
 }
 
+function identity(id: string): PrimarySummaryIdentity {
+  return {
+    id,
+    contentHash: `content-${id}`,
+    carrierHash: `carrier-${id}`,
+    sourceLeafHash: `leaf-${id}`,
+  };
+}
+
+function projection(branchId: string, generation: number, ids: string[]): PrimarySummaryProjection {
+  return {
+    namespace: 'default',
+    branch: { id: branchId, name: 'main', generation },
+    selectedSummaries: ids.map((id, index) => ({
+      identity: identity(id),
+      level: 1,
+      orderedSourceIds: [`src-${id}-1`, `src-${id}-2`],
+      renderedAs: 'summary_pair' as const,
+      pairRange: { start: index * 2, end: index * 2 + 1 },
+    })),
+  };
+}
+
+function request(system: string, text: string): NormalizedRequest {
+  return {
+    system,
+    messages: [{ participant: 'user', content: [{ type: 'text', text }] }],
+    config: { model: 'test-model', maxTokens: 256 },
+    assistantParticipant: 'assistant',
+    promptCaching: true,
+    cacheTtl: '1h',
+  };
+}
+
+function artifacts(systemTag: string, summaryIds: string[], branchId = 'branch-a', generation = 1) {
+  return {
+    compileResult: {
+      messages: [
+        { participant: 'Context Manager', content: [{ type: 'text', text: 'What do you remember from earlier?' }] },
+        { participant: 'assistant', content: [{ type: 'text', text: `summary ${summaryIds.join(',')}` }] },
+        { participant: 'user', content: [{ type: 'text', text: 'latest input' }] },
+      ],
+      systemInjections: [],
+      primarySummaryProjection: projection(branchId, generation, summaryIds),
+    },
+    contract: {
+      systemHash: `system-${systemTag}`,
+      modelConfigHash: `model-${systemTag}`,
+      toolContractHash: `tools-${systemTag}`,
+    },
+  };
+}
+
+function branchInfo(id = 'branch-a', generation = 1) {
+  return {
+    id,
+    name: 'main',
+    head: 1,
+    generation,
+    created: new Date('2026-07-17T00:00:00.000Z'),
+  };
+}
+
+function refusalResponse(content: ContentBlock[] = []): NormalizedResponse {
+  return {
+    ...createMockResponse(content, 'refusal'),
+    content,
+    stopReason: 'refusal',
+    rawAssistantText: '',
+    toolCalls: [],
+    usage: { inputTokens: 40, outputTokens: 0 },
+    details: {
+      usage: { inputTokens: 40, outputTokens: 0 },
+      stop: { reason: 'refusal', wasTruncated: false },
+    },
+    raw: {
+      response: {
+        stop_details: { category: 'reasoning_extraction' },
+      },
+    },
+  } as unknown as NormalizedResponse;
+}
+
+function outputResponse(text = 'Recovered'): NormalizedResponse {
+  return createMockResponse([{ type: 'text', text }]);
+}
+
+class HookedCompleteStream implements YieldingStream {
+  readonly isWaitingForTools = false;
+  readonly pendingToolCallIds: string[] = [];
+  readonly toolDepth = 0;
+
+  constructor(
+    private readonly response: NormalizedResponse,
+    private readonly beforeYield?: () => Promise<void> | void,
+  ) {}
+
+  provideToolResults(): void {
+    throw new Error('HookedCompleteStream does not support tool rounds');
+  }
+
+  cancel(): void {}
+
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    await this.beforeYield?.();
+    yield { type: 'complete', response: this.response } as StreamEvent;
+  }
+}
+
+class ScriptedMembrane {
+  readonly calls: NormalizedRequest[] = [];
+
+  constructor(private readonly responsesByCall: Array<NormalizedResponse[] | YieldingStream>) {}
+
+  complete(): Promise<NormalizedResponse> {
+    throw new Error('complete() should not be used by the primary streaming fallback path');
+  }
+
+  streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(structuredClone(request));
+    const next = this.responsesByCall.shift();
+    if (!next) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'default' }])]);
+    return Array.isArray(next) ? new MockYieldingStream(next) : next;
+  }
+
+  asMembrane(): import('@animalabs/membrane').Membrane {
+    return this as unknown as import('@animalabs/membrane').Membrane;
+  }
+}
+
+async function persistHealthyBaseline(
+  framework: AgentFramework,
+  agent: NonNullable<ReturnType<AgentFramework['getAgent']>>,
+  baselineRequest: NormalizedRequest,
+  baselineArtifacts: ReturnType<typeof artifacts>,
+) {
+  const build = (framework as unknown as {
+    buildPrimarySummaryRequestRecord: (...args: unknown[]) => Record<string, unknown>;
+  }).buildPrimarySummaryRequestRecord.bind(framework);
+  const persist = (framework as unknown as {
+    persistPrimarySummaryRequestRecord: (record: Record<string, unknown>) => Promise<void>;
+  }).persistPrimarySummaryRequestRecord.bind(framework);
+  const record = build(
+    agent,
+    'baseline-request',
+    'primary',
+    baselineRequest,
+    baselineArtifacts,
+    branchInfo(
+      baselineArtifacts.compileResult.primarySummaryProjection!.branch.id,
+      baselineArtifacts.compileResult.primarySummaryProjection!.branch.generation,
+    ),
+    'end_turn',
+    true,
+    0,
+    30,
+    'success',
+  );
+  await persist(record);
+}
+
 const DATA_METHODS = [
   'push/event',
   'inference/request',
@@ -235,6 +405,150 @@ for (const order of ['heartbeat-first', 'discord-first'] as const) {
     },
   );
 }
+
+test('runtime awareness barrier blocks internally queued fallback retries until the newest release', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-fallback-retry-'));
+  const storePath = join(dir, 'store');
+  const outboxPath = join(dir, 'awareness.json');
+  const statusPath = join(dir, 'status.jsonl');
+  const releasePath = join(dir, 'release');
+  const listChangePath = join(dir, 'list-change');
+  const outbox = new DiscordAwarenessOutbox(outboxPath);
+  const membrane = new ScriptedMembrane([
+    new HookedCompleteStream(refusalResponse(), async () => {
+      const batch = outbox.prepare({
+        agentName: 'assistant',
+        sourceBranch: 'source',
+        targetBranch: 'main',
+        activationPolicy: 'explicit',
+        refs: [{ serverId: 'discord', channelId: 'discord:guild:runtime', messageId: 'runtime-fallback-barrier' }],
+      });
+      assert.ok(batch);
+      outbox.activate(batch.id);
+      writeFileSync(listChangePath, 'change');
+      await waitFor('first runtime reaction call', () =>
+        records(statusPath).some((record) => record.event === 'reaction-call' && record.ordinal === 1));
+    }),
+    [outputResponse('Recovered after awareness barrier')],
+  ]);
+  let framework: AgentFramework | undefined;
+
+  try {
+    framework = await AgentFramework.create({
+      storePath,
+      discordAwarenessOutboxPath: outboxPath,
+      discordAwarenessDeadlineMs: 1_000,
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'assistant',
+        model: 'test-model',
+        systemPrompt: 'system',
+        refusalHandling: {
+          primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
+        },
+      }],
+      modules: [],
+      mcplServers: [{
+        id: 'discord',
+        command: process.execPath,
+        args: [FIXTURE],
+        requestTimeoutMs: 0,
+        env: {
+          STATUS_PATH: statusPath,
+          LEDGER_PATH: outboxPath,
+          RELEASE_PATH: releasePath,
+          LIST_CHANGE_PATH: listChangePath,
+          DATA_METHOD: 'host/command',
+        },
+        enabledFeatureSets: ['chat'],
+      }],
+    });
+    const agent = framework.getAgent('assistant')!;
+    const baselineRequest = request('system', 'baseline');
+    const baselineArtifacts = artifacts('shared', ['L1-1']);
+    await persistHealthyBaseline(framework, agent, baselineRequest, baselineArtifacts);
+
+    const currentRequest = request('system', 'latest input');
+    const currentArtifacts = artifacts('shared', ['L1-1', 'L1-2']);
+    const retryRequest = request('system', 'expanded raw source');
+    (agent as unknown as {
+      prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+      buildPrimarySummaryRawExpansionRequest: (
+        artifacts: typeof currentArtifacts,
+        summaries: ReadonlyArray<PrimarySummaryIdentity>,
+      ) => { request: NormalizedRequest; artifacts: typeof currentArtifacts };
+      getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+    }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+    (agent as unknown as {
+      buildPrimarySummaryRawExpansionRequest: (
+        artifacts: typeof currentArtifacts,
+        summaries: ReadonlyArray<PrimarySummaryIdentity>,
+      ) => { request: NormalizedRequest; artifacts: typeof currentArtifacts };
+    }).buildPrimarySummaryRawExpansionRequest = () => ({ request: retryRequest, artifacts: currentArtifacts });
+    (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+      () => branchInfo();
+
+    (framework as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+    }).pendingRequests.push({
+      agentName: 'assistant',
+      reason: 'test',
+      source: 'test',
+      timestamp: Date.now(),
+    });
+
+    let drained = false;
+    const draining = framework.runUntilIdle().then(() => { drained = true; });
+
+    await waitFor('primary provider call', () => membrane.calls.length === 1);
+    await waitFor('fallback intent while barrier is unresolved', () => {
+      const raw = framework!.getStore().getStateJson(FALLBACK_STATE_ID) as { requests?: Array<Record<string, unknown>> } | null;
+      return (raw?.requests ?? []).some((record) =>
+        record.dispatchKind === 'primary'
+        && record.requestId !== 'baseline-request'
+        && record.fallbackStatus === 'pending');
+    });
+
+    assert.equal(membrane.calls.length, 1, 'queued fallback retry must not dispatch under an unresolved barrier');
+    assert.equal(
+      records(statusPath).some((record) => record.event === 'registration-response'),
+      true,
+      'registration control plane stays live during the barrier',
+    );
+    assert.equal(
+      records(statusPath).some((record) => record.event === 'reaction-call'),
+      true,
+      'awareness reaction tooling stays live during the barrier',
+    );
+    assert.equal(drained, false, 'runUntilIdle remains blocked behind the unresolved retry barrier');
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      membrane.calls.length,
+      1,
+      'the unresolved awareness barrier must keep the retry blocked without a third-party dispatch',
+    );
+
+    writeFileSync(releasePath, 'release');
+    await waitFor('single fallback retry dispatch after release', () => membrane.calls.length === 2);
+    await draining;
+
+    const fallbackDispatches = membrane.calls.filter((call) =>
+      (call.messages[0]?.content[0] as { type?: string; text?: string } | undefined)?.type === 'text'
+      && (call.messages[0]?.content[0] as { text?: string } | undefined)?.text === 'expanded raw source',
+    );
+    assert.equal(fallbackDispatches.length, 1, 'the awareness barrier may release exactly one fallback retry dispatch');
+    assert.equal(
+      records(statusPath).filter((record) => record.event === 'reaction-call').length,
+      1,
+      'barrier control traffic should not spin into a hot loop',
+    );
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('mandatory awareness deadline survives requestTimeoutMs: 0 and durably releases startup', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });

@@ -227,6 +227,23 @@ interface PrimarySummaryFallbackOutputRecord {
   persistedAt: number;
 }
 
+interface PrimarySummaryPersistenceRecord {
+  participant: string;
+  contentHash: string;
+  blockTypes: string[];
+}
+
+interface PrimarySummaryPendingSettlement {
+  outcome: 'success' | 'held';
+  stopReason?: string;
+  holdReason?: string;
+  providerInputTokens?: number;
+  visibleAssistantOutput: boolean;
+  executedToolCalls: number;
+  chronicle: PrimarySummaryPersistenceRecord[];
+  preparedAt: number;
+}
+
 interface PrimarySummaryFallbackToolDispatchRecord {
   callId: string;
   inputHash: string;
@@ -254,6 +271,7 @@ interface PrimarySummaryRequestRecord {
   fallbackIntent?: PrimarySummaryFallbackIntentRecord;
   fallbackStatus?: PrimarySummaryFallbackStatus;
   fallbackHeldReason?: string;
+  pendingSettlement?: PrimarySummaryPendingSettlement;
 }
 
 interface PrimarySummaryFallbackState {
@@ -778,14 +796,14 @@ export class AgentFramework {
       }
     }
 
-    // Restore persisted usage data (if any) from prior session
-    framework.restoreUsageState();
-    await framework.reconcilePrimarySummaryFallbackStateOnStartup();
-
     // Create agents
     for (const agentConfig of config.agents) {
       await framework.createAgent(agentConfig);
     }
+
+    // Restore persisted usage data (if any) from prior session
+    framework.restoreUsageState();
+    await framework.reconcilePrimarySummaryFallbackStateOnStartup();
 
     // Finish any branch-local suppression interrupted after Chronicle switched
     // branches. This runs before modules, MCPL connections, or inbound traffic.
@@ -1816,10 +1834,24 @@ export class AgentFramework {
 
   private async reconcilePrimarySummaryFallbackStateOnStartup(): Promise<void> {
     const alerts: Array<{ agentName: string; requestId: string; reason: string }> = [];
+    const pendingSettlements = (await this.withPrimarySummaryStateLock(() =>
+      this.readPrimarySummaryFallbackState().requests
+        .filter((record) => record.pendingSettlement)
+        .map((record) => structuredClone(record)),
+    )) as PrimarySummaryRequestRecord[];
+
+    const finalizedRequestIds = new Set<string>();
+    for (const record of pendingSettlements) {
+      if (await this.finalizePrimarySummarySettlementOnStartup(record)) {
+        finalizedRequestIds.add(record.requestId);
+      }
+    }
+
     await this.withPrimarySummaryStateLock(() => {
       const state = this.readPrimarySummaryFallbackState();
       let changed = false;
       state.requests = state.requests.map((record) => {
+        if (finalizedRequestIds.has(record.requestId)) return record;
         if (record.dispatchKind === 'primary_summary_fallback_retry' && record.finalStatus === 'pending') {
           changed = true;
           const reason = 'primary_summary_fallback_unresolved_on_restart';
@@ -1828,6 +1860,7 @@ export class AgentFramework {
             ...record,
             finalStatus: 'held',
             fallbackHeldReason: reason,
+            pendingSettlement: undefined,
           };
         }
         if (record.finalStatus === 'pending') {
@@ -1838,6 +1871,7 @@ export class AgentFramework {
             ...record,
             finalStatus: 'timeout_unknown',
             fallbackHeldReason: reason,
+            pendingSettlement: undefined,
           };
         }
         if (record.fallbackIntent && record.fallbackStatus === 'pending') {
@@ -1969,6 +2003,241 @@ export class AgentFramework {
 
   private primarySummaryFallbackBlockTypes(blocks: ReadonlyArray<ContentBlock>): string[] {
     return blocks.map((block) => block.type);
+  }
+
+  private static readonly NON_EXECUTED_TOOL_RESULT_TEXT = '[tool not executed]';
+
+  private buildNonExecutedToolResults(
+    blocks: ReadonlyArray<ContentBlock>,
+  ): ContentBlock[] {
+    return blocks
+      .filter((block): block is ContentBlock & { type: 'tool_use'; id: string } => block.type === 'tool_use')
+      .map((block) => ({
+        type: 'tool_result' as const,
+        toolUseId: block.id,
+        content: AgentFramework.NON_EXECUTED_TOOL_RESULT_TEXT,
+        isError: true,
+      }));
+  }
+
+  private buildPrimarySummaryPersistencePlan(
+    entries: Array<{ participant: string; content: ReadonlyArray<ContentBlock> }>,
+  ): PrimarySummaryPersistenceRecord[] {
+    return entries
+      .filter((entry) => entry.content.length > 0)
+      .map((entry) => ({
+        participant: entry.participant,
+        contentHash: this.primarySummaryFallbackOutputPhaseHash(entry.content),
+        blockTypes: this.primarySummaryFallbackBlockTypes(entry.content),
+      }));
+  }
+
+  private primarySummaryPersistencePlanExists(
+    agent: Agent,
+    expectedBranchName: string,
+    plan: ReadonlyArray<PrimarySummaryPersistenceRecord>,
+  ): boolean {
+    if (plan.length === 0) return true;
+    const contextManager = agent.getContextManager();
+    if (contextManager.currentBranch().name !== expectedBranchName) return false;
+    const messages = contextManager.getAllMessages();
+    for (let start = 0; start <= messages.length - plan.length; start++) {
+      let matched = true;
+      for (let offset = 0; offset < plan.length; offset++) {
+        const message = messages[start + offset]!;
+        const expected = plan[offset]!;
+        if (
+          message.participant !== expected.participant ||
+          this.primarySummaryFallbackOutputPhaseHash(message.content) !== expected.contentHash ||
+          this.primarySummaryFallbackBlockTypes(message.content).join('\u0000') !== expected.blockTypes.join('\u0000')
+        ) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) return true;
+    }
+    return false;
+  }
+
+  private async persistPrimarySummaryVisibleOutput(
+    agent: Agent,
+    entries: Array<{ participant: string; content: ContentBlock[] }>,
+  ): Promise<string[]> {
+    const messageIds: string[] = [];
+    for (const entry of entries) {
+      if (entry.content.length === 0) continue;
+      messageIds.push(agent.getContextManager().addMessage(entry.participant, entry.content));
+    }
+    return messageIds;
+  }
+
+  private async preparePrimarySummarySettlement(
+    requestId: string,
+    settlement: PrimarySummaryPendingSettlement,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      stopReason: settlement.stopReason ?? record.stopReason,
+      providerInputTokens: settlement.providerInputTokens ?? record.providerInputTokens,
+      visibleAssistantOutput: settlement.visibleAssistantOutput,
+      executedToolCalls: settlement.executedToolCalls,
+      pendingSettlement: settlement,
+    }));
+  }
+
+  private async clearPrimarySummarySettlement(requestId: string): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      pendingSettlement: undefined,
+    }));
+  }
+
+  private async persistPrimarySummaryHeldOutput(
+    agent: Agent,
+    requestId: string,
+    holdReason: string,
+    options: {
+      stopReason?: string;
+      providerInputTokens?: number;
+      visibleAssistantOutput: boolean;
+      executedToolCalls: number;
+      assistantBlocks: ContentBlock[];
+      retryDispatch?: PrimarySummaryFallbackRetryDispatch;
+      retryPhase?: string;
+      holdData?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    const placeholderBlocks = this.buildNonExecutedToolResults(options.assistantBlocks);
+    const chronicle = this.buildPrimarySummaryPersistencePlan([
+      { participant: agent.name, content: options.assistantBlocks },
+      { participant: 'user', content: placeholderBlocks },
+    ]);
+    await this.preparePrimarySummarySettlement(requestId, {
+      outcome: 'held',
+      stopReason: options.stopReason,
+      holdReason,
+      providerInputTokens: options.providerInputTokens,
+      visibleAssistantOutput: options.visibleAssistantOutput,
+      executedToolCalls: options.executedToolCalls,
+      chronicle,
+      preparedAt: Date.now(),
+    });
+    const messageIds = await this.persistPrimarySummaryVisibleOutput(agent, [
+      { participant: agent.name, content: options.assistantBlocks },
+      { participant: 'user', content: placeholderBlocks },
+    ]);
+    if (options.retryDispatch && options.retryPhase && options.assistantBlocks.length > 0) {
+      await this.recordPrimarySummaryRetryOutput(
+        options.retryDispatch.originalRequestId,
+        options.retryDispatch.intentId,
+        {
+          phase: options.retryPhase,
+          contentHash: this.primarySummaryFallbackOutputPhaseHash(options.assistantBlocks),
+          messageId: messageIds[0] ?? '',
+          blockTypes: this.primarySummaryFallbackBlockTypes(options.assistantBlocks),
+          persistedAt: Date.now(),
+        },
+      );
+    }
+    if (options.retryDispatch) {
+      await this.holdPrimarySummaryRetryFamily(
+        agent,
+        requestId,
+        options.retryDispatch,
+        holdReason,
+        options.holdData,
+      );
+      return;
+    }
+    await this.holdPrimarySummaryRequest(agent, requestId, holdReason, options.holdData);
+  }
+
+  private async findPrimarySummaryRetryParent(
+    retryRequestId: string,
+  ): Promise<{ originalRequestId: string; intentId: string } | null> {
+    return this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      for (const record of state.requests) {
+        const intent = record.fallbackIntent;
+        if (intent?.retryRequestId === retryRequestId) {
+          return { originalRequestId: record.requestId, intentId: intent.intentId };
+        }
+      }
+      return null;
+    });
+  }
+
+  private async finalizePrimarySummarySettlementOnStartup(
+    record: PrimarySummaryRequestRecord,
+  ): Promise<boolean> {
+    const settlement = record.pendingSettlement;
+    if (!settlement) return false;
+    const agent = this.agents.get(record.agentName);
+    if (!agent) return false;
+    if (!this.primarySummaryPersistencePlanExists(agent, record.branch.name, settlement.chronicle)) {
+      return false;
+    }
+
+    if (record.dispatchKind === 'primary_summary_fallback_retry') {
+      const parent = await this.findPrimarySummaryRetryParent(record.requestId);
+      if (!parent) return false;
+      if (settlement.outcome === 'success') {
+        await this.updatePrimarySummaryRequestRecord(record.requestId, (entry) => ({
+          ...entry,
+          stopReason: settlement.stopReason ?? entry.stopReason,
+          providerInputTokens: settlement.providerInputTokens ?? entry.providerInputTokens,
+          visibleAssistantOutput: settlement.visibleAssistantOutput,
+          executedToolCalls: settlement.executedToolCalls,
+          finalStatus: 'success',
+          fallbackHeldReason: undefined,
+          pendingSettlement: undefined,
+        }));
+        await this.updatePrimarySummaryRequestRecord(parent.originalRequestId, (entry) => {
+          const intent = entry.fallbackIntent;
+          return {
+            ...entry,
+            finalStatus: 'success',
+            fallbackStatus: 'success',
+            fallbackHeldReason: undefined,
+            fallbackIntent: intent && intent.intentId === parent.intentId
+              ? { ...intent, finalizedAt: intent.finalizedAt ?? Date.now() }
+              : intent,
+          };
+        });
+        return true;
+      }
+      await this.updatePrimarySummaryRequestRecord(record.requestId, (entry) => ({
+        ...entry,
+        stopReason: settlement.stopReason ?? entry.stopReason,
+        providerInputTokens: settlement.providerInputTokens ?? entry.providerInputTokens,
+        visibleAssistantOutput: settlement.visibleAssistantOutput,
+        executedToolCalls: settlement.executedToolCalls,
+        finalStatus: 'held',
+        fallbackHeldReason: settlement.holdReason,
+        pendingSettlement: undefined,
+      }));
+      await this.updatePrimarySummaryRequestRecord(parent.originalRequestId, (entry) => ({
+        ...entry,
+        finalStatus: 'held',
+        fallbackStatus: 'held',
+        fallbackHeldReason: settlement.holdReason,
+      }));
+      return true;
+    }
+
+    await this.updatePrimarySummaryRequestRecord(record.requestId, (entry) => ({
+      ...entry,
+      stopReason: settlement.stopReason ?? entry.stopReason,
+      providerInputTokens: settlement.providerInputTokens ?? entry.providerInputTokens,
+      visibleAssistantOutput: settlement.visibleAssistantOutput,
+      executedToolCalls: settlement.executedToolCalls,
+      finalStatus: settlement.outcome === 'success' ? 'success' : 'held',
+      fallbackStatus: settlement.outcome === 'success' ? entry.fallbackStatus : 'held',
+      fallbackHeldReason: settlement.outcome === 'held' ? settlement.holdReason : undefined,
+      pendingSettlement: undefined,
+    }));
+    return true;
   }
 
   private summarizePrimarySummaryRetryRequest(request: NormalizedRequest): Record<string, unknown> {
@@ -2267,6 +2536,7 @@ export class AgentFramework {
       executedToolCalls,
       finalStatus: 'success',
       fallbackHeldReason: undefined,
+      pendingSettlement: undefined,
     }));
     await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => {
       const intent = record.fallbackIntent;
@@ -2304,6 +2574,7 @@ export class AgentFramework {
       ...(options?.stopReason ? { stopReason: options.stopReason } : {}),
       finalStatus: 'held',
       fallbackHeldReason: reason,
+      pendingSettlement: undefined,
     }));
     await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => ({
       ...record,
@@ -2370,6 +2641,7 @@ export class AgentFramework {
       finalStatus: 'held',
       fallbackStatus: 'held',
       fallbackHeldReason: reason,
+      pendingSettlement: undefined,
     }));
     this.opsAlert('refusal-held', agent.name, reason, { data });
     try {
@@ -4812,6 +5084,11 @@ export class AgentFramework {
         continue;
       }
 
+      if (this.discordAwarenessBarrier) {
+        this.pendingRequests.push(...requests);
+        continue;
+      }
+
       requests = requests.filter((request) =>
         request.reason !== 'context_budget_restart'
         || request.contextBudgetRestart?.dispatchKind !== 'primary_summary_fallback_retry'
@@ -5597,6 +5874,9 @@ export class AgentFramework {
             const terminalContent = lastToolIdx >= 0
               ? response.content.slice(lastToolIdx + 1)
               : response.content;
+            const heldAssistantContent = executedToolCalls > 0
+              ? terminalContent
+              : response.content;
             const visibleAssistantOutput = this.hasVisibleAssistantOutput(response.content);
             const providerInputTokens =
               response.usage?.inputTokens ??
@@ -5640,20 +5920,44 @@ export class AgentFramework {
                   : executedToolCalls > 0
                     ? 'primary_summary_fallback_retry_tool_already_executed'
                     : 'primary_summary_fallback_retry_refusal';
-                await this.holdPrimarySummaryRetryFamily(
-                  agent,
-                  requestId,
-                  primarySummaryRetry,
-                  reason,
-                  holdReasonData,
-                );
+                if (visibleAssistantOutput || executedToolCalls > 0) {
+                  await this.persistPrimarySummaryHeldOutput(agent, requestId, reason, {
+                    stopReason: response.stopReason,
+                    providerInputTokens,
+                    visibleAssistantOutput,
+                    executedToolCalls,
+                    assistantBlocks: heldAssistantContent,
+                    retryDispatch: primarySummaryRetry,
+                    retryPhase: 'refusal_visible_output',
+                    holdData: holdReasonData,
+                  });
+                } else {
+                  await this.holdPrimarySummaryRetryFamily(
+                    agent,
+                    requestId,
+                    primarySummaryRetry,
+                    reason,
+                    holdReasonData,
+                  );
+                }
               } else if (visibleAssistantOutput || executedToolCalls > 0 || !currentRecord?.projection) {
                 const reason = visibleAssistantOutput
                   ? 'primary_summary_refusal_partial_output'
                   : executedToolCalls > 0
                     ? 'primary_summary_refusal_tool_already_executed'
                     : 'primary_summary_refusal_no_projection';
-                await this.holdPrimarySummaryRequest(agent, requestId, reason, holdReasonData);
+                if (visibleAssistantOutput || executedToolCalls > 0) {
+                  await this.persistPrimarySummaryHeldOutput(agent, requestId, reason, {
+                    stopReason: response.stopReason,
+                    providerInputTokens,
+                    visibleAssistantOutput,
+                    executedToolCalls,
+                    assistantBlocks: heldAssistantContent,
+                    holdData: holdReasonData,
+                  });
+                } else {
+                  await this.holdPrimarySummaryRequest(agent, requestId, reason, holdReasonData);
+                }
               } else {
                 const state = this.readPrimarySummaryFallbackState();
                 const baseline = this.latestCompatibleHealthyPrimaryRequest(currentRecord, state);
@@ -5769,6 +6073,20 @@ export class AgentFramework {
 
             if (!(await persistPrimarySummaryRetryQuarantine())) {
               return;
+            }
+
+            if (primarySummaryRetry) {
+              await this.preparePrimarySummarySettlement(requestId, {
+                outcome: 'success',
+                stopReason: response.stopReason,
+                providerInputTokens,
+                visibleAssistantOutput,
+                executedToolCalls,
+                chronicle: this.buildPrimarySummaryPersistencePlan([
+                  { participant: agent.name, content: terminalContent },
+                ]),
+                preparedAt: Date.now(),
+              });
             }
 
             // Add assistant response to context.

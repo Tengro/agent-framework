@@ -35,6 +35,7 @@ const SUMMARY_PRIVATE_SENTINEL = 'SUMMARY_PRIVATE_SENTINEL_2026_07_17';
 const RETRY_OUTPUT_SENTINEL = 'RETRY_OUTPUT_SENTINEL_2026_07_17';
 const TOOL_ARG_SENTINEL = 'TOOL_ARG_SENTINEL_2026_07_17';
 const TOOL_RESULT_SENTINEL = 'TOOL_RESULT_SENTINEL_2026_07_17';
+const NON_EXECUTED_TOOL_RESULT = '[tool not executed]';
 
 const paths: string[] = [];
 let fixtureSequence = 0;
@@ -602,6 +603,88 @@ describe('primary summary refusal fallback integration', () => {
       }
       assert.equal(jsonContains(messages, TOOL_ARG_SENTINEL), true, 'canonical Chronicle output still carries the lived tool input');
       assert.equal(jsonContains(messages, TOOL_RESULT_SENTINEL), true, 'canonical Chronicle output still carries the lived tool result');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('holds retry text + tool_use output without executing tools, preserves pairing, and keeps fallback telemetry metadata-only', async () => {
+    const module = new EchoModule(() => false);
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [refusalResponse([
+        { type: 'thinking', thinking: 'reasoning carrier', signature: 'sig-1' } as ContentBlock,
+        { type: 'text', text: RETRY_OUTPUT_SENTINEL } as ContentBlock,
+        { type: 'tool_use', id: 'call-1', name: 'toolbox--echo', input: { message: TOOL_ARG_SENTINEL } } as ContentBlock,
+      ])],
+    ]);
+    const { framework, agent, strategy } = await createFrameworkFixture({ membrane, modules: [module] });
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'held-tool-use');
+
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 2);
+      assert.equal(module.calls.length, 0, 'held retry output must not execute tools');
+
+      const messages = (agent.getContextManager() as unknown as {
+        getAllMessages: () => Array<{ content: ContentBlock[] }>;
+      }).getAllMessages();
+      assert.equal(countMessagesContaining(messages, RETRY_OUTPUT_SENTINEL), 1);
+      assert.equal(countMessagesContaining(messages, TOOL_ARG_SENTINEL), 1);
+      assert.equal(countMessagesContaining(messages, NON_EXECUTED_TOOL_RESULT), 1);
+
+      const assistantIndex = messages.findIndex((message) =>
+        JSON.stringify(message.content).includes(RETRY_OUTPUT_SENTINEL));
+      assert.ok(assistantIndex >= 0);
+      assert.deepEqual(
+        messages[assistantIndex]!.content.map((block) => block.type),
+        ['thinking', 'text', 'tool_use'],
+      );
+      const persistedToolUse = messages[assistantIndex]!.content.find((block) => block.type === 'tool_use') as ContentBlock & {
+        type: 'tool_use';
+        id: string;
+        input: Record<string, unknown>;
+      };
+      assert.equal(persistedToolUse.id, 'call-1');
+      assert.equal(persistedToolUse.input.message, TOOL_ARG_SENTINEL);
+      const placeholder = messages[assistantIndex + 1]!.content[0] as ContentBlock & {
+        type: 'tool_result';
+        toolUseId: string;
+        content: string;
+        isError?: boolean;
+      };
+      assert.equal(placeholder.type, 'tool_result');
+      assert.equal(placeholder.toolUseId, 'call-1');
+      assert.equal(placeholder.content, NON_EXECUTED_TOOL_RESULT);
+      assert.equal(placeholder.isError, true);
+
+      const records = fallbackRecords(framework);
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.fallbackHeldReason, 'primary_summary_fallback_retry_partial_output');
+      assert.equal(retry.fallbackHeldReason, 'primary_summary_fallback_retry_partial_output');
+
+      const retryLogs = resolvedFallbackRetryLogs(framework);
+      const observabilityMaterial = [
+        fallbackState(framework),
+        ...retryLogs,
+      ];
+      for (const material of observabilityMaterial) {
+        assert.equal(jsonContains(material, RETRY_OUTPUT_SENTINEL), false);
+        assert.equal(jsonContains(material, TOOL_ARG_SENTINEL), false);
+        assert.equal(jsonContains(material, NON_EXECUTED_TOOL_RESULT), false);
+      }
+      assert.equal(jsonContains(messages, RETRY_OUTPUT_SENTINEL), true);
+      assert.equal(jsonContains(messages, TOOL_ARG_SENTINEL), true);
+      assert.equal(jsonContains(messages, NON_EXECUTED_TOOL_RESULT), true);
     } finally {
       await framework.stop();
     }
