@@ -104,6 +104,18 @@ export interface AgentConfig {
      * than dropping it silently. Default true.
      */
     announceHumanTurns?: boolean;
+    /**
+     * Primary-lane autobiographical summary refusal fallback. Disabled by
+     * default: when enabled, the framework may compare the refused primary
+     * request against the latest compatible healthy request on the same branch
+     * generation, expand newly admitted summary pairs back to exact raw
+     * source, and issue at most one retry.
+     */
+    primarySummaryFallback?: {
+      enabled?: boolean;
+      maxNewSummaries?: number;
+      requestBudgetTokens?: number;
+    };
   };
 }
 

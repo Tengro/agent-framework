@@ -1,14 +1,18 @@
 import { join } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type {
+  BranchGenerationInfo,
   MessageId,
   MessageMetadata,
   MessageQuery,
   MessageQueryResult,
+  PrimarySummaryIdentity,
+  PrimarySummaryProjection,
   StoredMessage,
 } from '@animalabs/context-manager';
 import type {
@@ -49,7 +53,7 @@ import type {
   AgentRuntimeSettingsSnapshot,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
-import { Agent } from './agent.js';
+import { Agent, type ActivationCompileArtifacts } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
@@ -118,6 +122,7 @@ const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
+const PRIMARY_SUMMARY_FALLBACK_STATE_ID = 'framework/primary-summary-fallback';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
@@ -135,6 +140,47 @@ interface TurnCheckpoint {
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
+}
+
+type PrimarySummaryFallbackStatus =
+  | 'success'
+  | 'refusal'
+  | 'held'
+  | 'pending'
+  | 'error'
+  | 'timeout_unknown';
+
+interface PrimarySummaryFallbackIntentRecord {
+  intentId: string;
+  createdAt: number;
+  candidateSummaries: PrimarySummaryIdentity[];
+  retryRequestHash: string;
+  retryInputBoundTokens: number;
+  requestBudgetTokens: number;
+}
+
+interface PrimarySummaryRequestRecord {
+  requestId: string;
+  agentName: string;
+  namespace: string;
+  timestamp: number;
+  branch: { id: string; name: string; generation: number };
+  projection: PrimarySummaryProjection | null;
+  requestInputBoundTokens: number;
+  providerInputTokens?: number;
+  modelConfigHash: string;
+  toolContractHash: string;
+  stopReason?: string;
+  visibleAssistantOutput: boolean;
+  executedToolCalls: number;
+  finalStatus: PrimarySummaryFallbackStatus;
+  fallbackIntent?: PrimarySummaryFallbackIntentRecord;
+  fallbackStatus?: Exclude<PrimarySummaryFallbackStatus, 'pending'>;
+  fallbackHeldReason?: string;
+}
+
+interface PrimarySummaryFallbackState {
+  requests: PrimarySummaryRequestRecord[];
 }
 
 /**
@@ -329,6 +375,7 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+  private primarySummaryStateLock: Promise<void> = Promise.resolve();
 
   /** Per-agent output locus pinned for the CURRENT logical turn (see
    *  resolveTurnLocus in driveStream). Lives here — not in driveStream
@@ -578,6 +625,12 @@ export class AgentFramework {
       } catch {
         // Already registered
       }
+    }
+
+    try {
+      store.registerState({ id: PRIMARY_SUMMARY_FALLBACK_STATE_ID, strategy: 'snapshot' });
+    } catch {
+      // Already registered
     }
 
     const discordAwarenessOutboxPath = config.discordAwarenessOutboxPath
@@ -1405,6 +1458,189 @@ export class AgentFramework {
       reject = rej;
     });
     return { promise, resolve, reject };
+  }
+
+  private hashJson(value: unknown): string {
+    return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+  }
+
+  private estimateRequestInputBoundTokens(request: NormalizedRequest): number {
+    const serialized = JSON.stringify(request);
+    return Buffer.byteLength(serialized, 'utf8') + 512 + request.messages.length * 128;
+  }
+
+  private readPrimarySummaryFallbackState(): PrimarySummaryFallbackState {
+    const raw = this.store.getStateJson(PRIMARY_SUMMARY_FALLBACK_STATE_ID);
+    if (!raw || typeof raw !== 'object') return { requests: [] };
+    const requests = Array.isArray((raw as { requests?: unknown[] }).requests)
+      ? ((raw as { requests: PrimarySummaryRequestRecord[] }).requests)
+      : [];
+    return { requests };
+  }
+
+  private writePrimarySummaryFallbackState(state: PrimarySummaryFallbackState): void {
+    this.store.setStateJson(PRIMARY_SUMMARY_FALLBACK_STATE_ID, state);
+  }
+
+  private async withPrimarySummaryStateLock<T>(work: () => Promise<T> | T): Promise<T> {
+    const previous = this.primarySummaryStateLock;
+    let release!: () => void;
+    this.primarySummaryStateLock = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
+
+  private primarySummaryIdentityKey(identity: PrimarySummaryIdentity): string {
+    return [
+      identity.id,
+      identity.contentHash,
+      identity.carrierHash,
+      identity.sourceLeafHash,
+    ].join('\u0000');
+  }
+
+  private primarySummaryProjectionKeys(projection: PrimarySummaryProjection | null): string[] {
+    return projection?.selectedSummaries.map((selection) =>
+      this.primarySummaryIdentityKey(selection.identity),
+    ) ?? [];
+  }
+
+  private primarySummaryFallbackConfig(agent: Agent): {
+    enabled: boolean;
+    maxNewSummaries: number;
+    requestBudgetTokens: number;
+  } {
+    const raw = (agent.refusalHandling as {
+      primarySummaryFallback?: {
+        enabled?: boolean;
+        maxNewSummaries?: number;
+        requestBudgetTokens?: number;
+      };
+    } | undefined)?.primarySummaryFallback;
+    const fallbackBudgetBase = agent.contextBudgetTokens ?? 100_000;
+    return {
+      enabled: raw?.enabled === true,
+      maxNewSummaries:
+        typeof raw?.maxNewSummaries === 'number' && Number.isSafeInteger(raw.maxNewSummaries)
+          ? Math.max(0, raw.maxNewSummaries)
+          : 4,
+      requestBudgetTokens:
+        typeof raw?.requestBudgetTokens === 'number' && Number.isFinite(raw.requestBudgetTokens) && raw.requestBudgetTokens > 0
+          ? raw.requestBudgetTokens
+          : fallbackBudgetBase + agent.maxTokens,
+    };
+  }
+
+  private latestCompatibleHealthyPrimaryRequest(
+    current: PrimarySummaryRequestRecord,
+    state: PrimarySummaryFallbackState,
+  ): PrimarySummaryRequestRecord | null {
+    for (let i = state.requests.length - 1; i >= 0; i--) {
+      const candidate = state.requests[i]!;
+      if (candidate.requestId === current.requestId) continue;
+      if (candidate.agentName !== current.agentName) continue;
+      if (candidate.namespace !== current.namespace) continue;
+      if (candidate.branch.generation !== current.branch.generation) continue;
+      if (candidate.modelConfigHash !== current.modelConfigHash) continue;
+      if (candidate.toolContractHash !== current.toolContractHash) continue;
+      if (candidate.finalStatus !== 'success') continue;
+      return candidate;
+    }
+    return null;
+  }
+
+  private async persistPrimarySummaryRequestRecord(record: PrimarySummaryRequestRecord): Promise<void> {
+    await this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      const requests = state.requests.filter((entry) => entry.requestId !== record.requestId);
+      requests.push(record);
+      this.writePrimarySummaryFallbackState({ requests: requests.slice(-256) });
+    });
+  }
+
+  private async updatePrimarySummaryRequestRecord(
+    requestId: string,
+    update: (record: PrimarySummaryRequestRecord) => PrimarySummaryRequestRecord,
+  ): Promise<PrimarySummaryRequestRecord | null> {
+    return this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      const index = state.requests.findIndex((entry) => entry.requestId === requestId);
+      if (index < 0) return null;
+      state.requests[index] = update(state.requests[index]!);
+      this.writePrimarySummaryFallbackState({ requests: state.requests.slice(-256) });
+      return state.requests[index]!;
+    });
+  }
+
+  private async holdPrimarySummaryRequest(
+    agent: Agent,
+    requestId: string,
+    reason: string,
+    data?: Record<string, unknown>,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      finalStatus: 'held',
+      fallbackStatus: 'held',
+      fallbackHeldReason: reason,
+    }));
+    this.opsAlert('refusal-held', agent.name, reason, { data });
+    try {
+      agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text:
+            `[refusal-held] Your previous turn was refused by the provider and ` +
+            `is being held for operator review rather than silently retried. ` +
+            `Automatic raw-expansion recovery was either unsafe or unsuccessful.`,
+        }],
+        { system: true, kind: 'refusal-held', reason },
+      );
+    } catch (error) {
+      console.error('[refusal-held] could not record chronicle marker:', error);
+    }
+  }
+
+  private hasVisibleAssistantOutput(blocks: ReadonlyArray<ContentBlock>): boolean {
+    return blocks.some((block) => block.type !== 'thinking' && block.type !== 'redacted_thinking');
+  }
+
+  private buildPrimarySummaryRequestRecord(
+    agent: Agent,
+    requestId: string,
+    request: NormalizedRequest,
+    artifacts: ActivationCompileArtifacts | undefined,
+    branch: BranchGenerationInfo | null,
+    stopReason: string | undefined,
+    visibleAssistantOutput: boolean,
+    executedToolCalls: number,
+    providerInputTokens: number | undefined,
+    finalStatus: PrimarySummaryFallbackStatus,
+  ): PrimarySummaryRequestRecord {
+    const projection = artifacts?.compileResult.primarySummaryProjection ?? null;
+    return {
+      requestId,
+      agentName: agent.name,
+      namespace: `agents/${agent.name}`,
+      timestamp: Date.now(),
+      branch: branch
+        ? { id: branch.id, name: branch.name, generation: branch.generation }
+        : { id: 'unknown', name: 'unknown', generation: -1 },
+      projection,
+      requestInputBoundTokens: this.estimateRequestInputBoundTokens(request),
+      providerInputTokens,
+      modelConfigHash: artifacts?.contract.modelConfigHash ?? this.hashJson({ request: request.config }),
+      toolContractHash: artifacts?.contract.toolContractHash ?? this.hashJson(request.tools ?? []),
+      stopReason,
+      visibleAssistantOutput,
+      executedToolCalls,
+      finalStatus,
+    };
   }
 
   /** Liveness ping for an active ephemeral run (no-op otherwise). */
@@ -3770,9 +4006,9 @@ export class AgentFramework {
         }
       }
 
-      const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
+      const { stream, request: compiledRequest, artifacts } = await agent.startStreamWithInjections(tools, injections);
 
-      const handle = this.driveStream(agent, stream, trigger, attempt, compiledRequest);
+      const handle = this.driveStream(agent, stream, trigger, attempt, compiledRequest, artifacts);
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -3820,12 +4056,14 @@ export class AgentFramework {
     stream: YieldingStream,
     trigger?: InferenceRequest,
     attempt = 0,
-    compiledRequest?: NormalizedRequest
+    compiledRequest?: NormalizedRequest,
+    artifacts?: ActivationCompileArtifacts,
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
     let hadToolCalls = false;
+    let executedToolCalls = 0;
 
     // ---- Present-while-acting turn state ---------------------------------
     // Output locus for the current CONVERSATIONAL ROUND: resolved lazily and
@@ -3834,7 +4072,7 @@ export class AgentFramework {
     // single provider inference can now contain several conversations. The
     // pin lives in `turnLocusPins` so it survives a context-budget restart. A
     // null resolution is not pinned.
-    if (trigger?.reason !== 'context_budget_restart') {
+    if (trigger?.reason !== 'context_budget_restart' && trigger?.reason !== 'primary-summary-fallback-retry') {
       this.turnLocusPins.delete(agent.name);
       this.midTurnRoutingResets.delete(agent.name);
     }
@@ -3935,6 +4173,7 @@ export class AgentFramework {
           case 'tool-calls': {
             adoptInjectedRound();
             hadToolCalls = true;
+            executedToolCalls += event.calls.length;
             this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
