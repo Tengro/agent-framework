@@ -396,6 +396,85 @@ function thinkDescription(request: NormalizedRequest): string {
   return thinkTool.description;
 }
 
+async function expectInFlightResetRestoresNextInferencePolicy(opts: {
+  basePolicy?: 'public' | 'private';
+  resetInput: Record<string, unknown>;
+}): Promise<void> {
+  const membrane = new ScenarioMembrane();
+  membrane.queueScenario([
+    createMockResponse([
+      { type: 'text', text: 'private request before reset' },
+      { type: 'tool_use', id: 'think-1', name: 'think', input: { content: TILDE_THINK_4416 } },
+      {
+        type: 'tool_use',
+        id: 'settings-1',
+        name: 'agent_settings',
+        input: opts.resetInput,
+      },
+      { type: 'tool_use', id: 'read-1', name: 'tools--read', input: { path: 'project/secret.txt' } },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([
+      { type: 'text', text: 'still private in the continuation' },
+      { type: 'tool_use', id: 'think-2', name: 'think', input: { content: TILDE_THINK_4416 } },
+      { type: 'tool_use', id: 'ping-1', name: 'tools--ping', input: {} },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([] as ContentBlock[]),
+  ], { pauseAfterFirstToolRound: true });
+  membrane.queueScenario([
+    createMockResponse(makeToolRound('public on the next inference'), 'tool_use'),
+    createMockResponse([] as ContentBlock[]),
+  ]);
+  const { dir, framework, routed } = await createFramework({
+    ...(opts.basePolicy !== undefined ? { policy: opts.basePolicy } : {}),
+    membrane,
+  });
+  try {
+    framework.updateAgentRuntimeSettings('agent', { sameRoundThinkTextPolicy: 'private' });
+    assert.equal(
+      framework.getAgentRuntimeSettings('agent').sameRoundThinkTextPolicy,
+      'private',
+    );
+
+    framework.start();
+    trigger(framework);
+    await waitFor(() => membrane.calls.length === 1);
+    await waitFor(() => (membrane.lastStream as PausedAfterFirstToolRoundStream | null)?.receivedToolResults.length === 1);
+
+    const firstRoundResults = (membrane.lastStream as PausedAfterFirstToolRoundStream).receivedToolResults[0] as Array<{
+      toolUseId: string;
+      content: string;
+    }>;
+    const settingsResult = firstRoundResults.find((result) => result.toolUseId === 'settings-1');
+    assert.ok(settingsResult, 'agent_settings reset result should be present');
+    assert.match(settingsResult.content, /sameRoundThinkTextPolicyUpdateNote/);
+    assert.match(settingsResult.content, /next inference/);
+
+    assert.match(thinkDescription(membrane.calls[0]), /withheld from channel routing/);
+    assert.deepEqual(routed, []);
+    assert.equal(
+      framework.getAgentRuntimeSettings('agent').sameRoundThinkTextPolicy,
+      'public',
+    );
+    assert.match(
+      thinkDescription(await framework.previewActivation('agent')),
+      /may still be routed publicly as your speech/,
+    );
+
+    (membrane.lastStream as PausedAfterFirstToolRoundStream).release();
+    await waitFor(() => (framework as unknown as { activeStreams: Map<string, Promise<void>> }).activeStreams.size === 0);
+    assert.deepEqual(routed, []);
+
+    trigger(framework);
+    await waitFor(() => membrane.calls.length === 2);
+    await waitFor(() => routed.length === 1);
+    assert.match(thinkDescription(membrane.calls[1]), /may still be routed publicly as your speech/);
+    assert.deepEqual(routed, ['public on the next inference']);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe('same-round think text policy', () => {
   it('compatibility default/public routes the exact Tilde-shaped same-round preface', async () => {
     const membrane = new MockMembrane();
@@ -743,6 +822,47 @@ describe('same-round think text policy', () => {
         'public request before update',
         'still public in the continuation',
       ]);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('same-round agent_settings explicit reset restores the compatibility policy only on the next inference', async () => {
+    await expectInFlightResetRestoresNextInferencePolicy({
+      resetInput: { action: 'reset', settings: ['same_round_think_text_policy'] },
+    });
+  });
+
+  it('same-round agent_settings reset-all restores the recipe policy only on the next inference', async () => {
+    await expectInFlightResetRestoresNextInferencePolicy({
+      basePolicy: 'public',
+      resetInput: { action: 'reset' },
+    });
+  });
+
+  it('agent_settings reset without same_round_think_text_policy omits the next-inference note', async () => {
+    const membrane = new ScenarioMembrane();
+    membrane.queueScenario([
+      createMockResponse([
+        { type: 'tool_use', id: 'settings-1', name: 'agent_settings', input: { action: 'reset', settings: ['tail_tokens'] } },
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([] as ContentBlock[]),
+    ], { pauseAfterFirstToolRound: true });
+    const { dir, framework } = await createFramework({ membrane });
+    try {
+      framework.start();
+      trigger(framework);
+      await waitFor(() => membrane.calls.length === 1);
+      await waitFor(() => (membrane.lastStream as PausedAfterFirstToolRoundStream | null)?.receivedToolResults.length === 1);
+
+      const firstRoundResults = (membrane.lastStream as PausedAfterFirstToolRoundStream).receivedToolResults[0] as Array<{
+        toolUseId: string;
+        content: string;
+      }>;
+      const settingsResult = firstRoundResults.find((result) => result.toolUseId === 'settings-1');
+      assert.ok(settingsResult, 'agent_settings reset result should be present');
+      assert.doesNotMatch(settingsResult.content, /sameRoundThinkTextPolicyUpdateNote/);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

@@ -7004,6 +7004,7 @@ export class AgentFramework {
         case 'reset': {
           let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
           const extResetKeys = new Map<AgentSettingsExtension, string[]>();
+          const resetsAllSettings = input.settings === undefined;
           if (input.settings !== undefined) {
             if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
             const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
@@ -7028,6 +7029,8 @@ export class AgentFramework {
             }
             if (keys.length === 0) keys = undefined;
           }
+          const touchedSameRoundThinkTextPolicy =
+            resetsAllSettings || keys?.includes('sameRoundThinkTextPolicy') === true;
           const extResults: Record<string, unknown> = {};
           if (input.settings === undefined) {
             // Reset-all covers extensions too.
@@ -7043,7 +7046,20 @@ export class AgentFramework {
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);
-          result = { success: true, data: { ...core, ...extGet(), ...extResults } };
+          result = {
+            success: true,
+            data: {
+              ...core,
+              ...extGet(),
+              ...extResults,
+              ...(touchedSameRoundThinkTextPolicy
+                ? {
+                    sameRoundThinkTextPolicyUpdateNote:
+                      'Reset now; restored provider think routing and description apply beginning with the next inference.',
+                  }
+                : {}),
+            },
+          };
           break;
         }
         default:
