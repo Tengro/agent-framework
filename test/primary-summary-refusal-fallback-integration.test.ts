@@ -35,7 +35,9 @@ const SUMMARY_PRIVATE_SENTINEL = 'SUMMARY_PRIVATE_SENTINEL_2026_07_17';
 const RETRY_OUTPUT_SENTINEL = 'RETRY_OUTPUT_SENTINEL_2026_07_17';
 const TOOL_ARG_SENTINEL = 'TOOL_ARG_SENTINEL_2026_07_17';
 const TOOL_RESULT_SENTINEL = 'TOOL_RESULT_SENTINEL_2026_07_17';
+const FINAL_TOOL_ARG_SENTINEL = 'FINAL_TOOL_ARG_SENTINEL_2026_07_17';
 const NON_EXECUTED_TOOL_RESULT = '[tool not executed]';
+const PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY = 'primarySummarySettlement';
 
 const paths: string[] = [];
 let fixtureSequence = 0;
@@ -244,6 +246,82 @@ function countMessagesContaining(messages: Array<{ content: ContentBlock[] }>, n
   return messages.filter((message) => JSON.stringify(message.content).includes(needle)).length;
 }
 
+function chronicleMessages(agent: NonNullable<ReturnType<AgentFramework['getAgent']>>): Array<{
+  id: string;
+  participant: string;
+  content: ContentBlock[];
+  metadata?: Record<string, unknown>;
+}> {
+  return (agent.getContextManager() as unknown as {
+    getAllMessages: () => Array<{
+      id: string;
+      participant: string;
+      content: ContentBlock[];
+      metadata?: Record<string, unknown>;
+    }>;
+  }).getAllMessages();
+}
+
+function settlementMessages(
+  agent: NonNullable<ReturnType<AgentFramework['getAgent']>>,
+  requestId: string,
+): Array<{
+  id: string;
+  participant: string;
+  content: ContentBlock[];
+  metadata?: Record<string, unknown>;
+}> {
+  return chronicleMessages(agent).filter((message) =>
+    ((message.metadata?.[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY] as { requestId?: string } | undefined)?.requestId) === requestId);
+}
+
+function settlementMetadata(options: {
+  requestId: string;
+  agentName?: string;
+  dispatchKind?: 'primary' | 'primary_summary_fallback_retry';
+  outcome?: 'held' | 'success';
+  branchId?: string;
+  branchName?: string;
+  branchGeneration?: number;
+  holdReason?: string;
+  stopReason?: string;
+  providerInputTokens?: number;
+  visibleAssistantOutput?: boolean;
+  executedToolCalls?: number;
+  entryIndex: number;
+  entryCount: number;
+  role: 'assistant' | 'user';
+  kind: 'assistant_output' | 'generated_tool_result';
+  settlementId?: string;
+}): Record<string, unknown> {
+  const dispatchKind = options.dispatchKind ?? 'primary';
+  const outcome = options.outcome ?? 'held';
+  return {
+    [PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY]: {
+      version: 1,
+      requestId: options.requestId,
+      settlementId: options.settlementId ?? `${dispatchKind}:${outcome}:terminal:v1`,
+      agentName: options.agentName ?? 'assistant',
+      dispatchKind,
+      outcome,
+      ...(options.holdReason ? { holdReason: options.holdReason } : {}),
+      ...(options.stopReason ? { stopReason: options.stopReason } : {}),
+      ...(options.providerInputTokens !== undefined ? { providerInputTokens: options.providerInputTokens } : {}),
+      visibleAssistantOutput: options.visibleAssistantOutput ?? true,
+      executedToolCalls: options.executedToolCalls ?? 0,
+      branch: {
+        id: options.branchId ?? 'main',
+        name: options.branchName ?? options.branchId ?? 'main',
+        generation: options.branchGeneration ?? 1,
+      },
+      role: options.role,
+      kind: options.kind,
+      entryIndex: options.entryIndex,
+      entryCount: options.entryCount,
+    },
+  };
+}
+
 function branchInfo(id = 'main', generation = 1) {
   return {
     id,
@@ -251,6 +329,25 @@ function branchInfo(id = 'main', generation = 1) {
     head: 1,
     generation,
     created: new Date(NODELESS_DATE),
+  };
+}
+
+function projection(branchId: string, generation: number, ids: string[]): Record<string, unknown> {
+  return {
+    namespace: 'default',
+    branch: { id: branchId, name: branchId, generation },
+    selectedSummaries: ids.map((id, index) => ({
+      identity: {
+        id,
+        contentHash: `content-${id}`,
+        carrierHash: `carrier-${id}`,
+        sourceLeafHash: `leaf-${id}`,
+      },
+      level: 1,
+      orderedSourceIds: [`src-${id}-1`, `src-${id}-2`],
+      renderedAs: 'summary_pair',
+      pairRange: { start: index * 2, end: index * 2 + 1 },
+    })),
   };
 }
 
@@ -407,6 +504,44 @@ function latestPrimaryRecord(framework: AgentFramework, requestIdExclusions: str
       record.dispatchKind === 'primary'
       && !requestIdExclusions.includes(String(record.requestId)))
     .at(-1)!;
+}
+
+function manualPrimaryRecord(options: {
+  requestId: string;
+  finalStatus?: 'pending' | 'refusal' | 'held' | 'success';
+  fallbackStatus?: 'pending' | 'refusal' | 'held' | 'success';
+  fallbackHeldReason?: string;
+  branchId?: string;
+  branchName?: string;
+  branchGeneration?: number;
+  projectionIds?: string[];
+  fallbackIntent?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const branchId = options.branchId ?? 'main';
+  const branchName = options.branchName ?? branchId;
+  const branchGeneration = options.branchGeneration ?? 1;
+  return {
+    requestId: options.requestId,
+    agentName: 'assistant',
+    namespace: 'default',
+    timestamp: Date.now(),
+    dispatchKind: 'primary',
+    branch: { id: branchId, name: branchName, generation: branchGeneration },
+    projection: projection(branchId, branchGeneration, options.projectionIds ?? ['L1-X']),
+    requestInputBoundTokens: 100,
+    requestCompleteBoundTokens: 200,
+    providerInputTokens: 40,
+    systemHash: 'system-shared',
+    modelConfigHash: 'model-shared',
+    toolContractHash: 'tools-shared',
+    stopReason: 'refusal',
+    visibleAssistantOutput: true,
+    executedToolCalls: 0,
+    finalStatus: options.finalStatus ?? 'refusal',
+    ...(options.fallbackStatus ? { fallbackStatus: options.fallbackStatus } : {}),
+    ...(options.fallbackHeldReason ? { fallbackHeldReason: options.fallbackHeldReason } : {}),
+    ...(options.fallbackIntent ? { fallbackIntent: options.fallbackIntent } : {}),
+  };
 }
 
 function resolvedFallbackRetryLogs(framework: AgentFramework): Array<Record<string, unknown>> {
@@ -690,6 +825,151 @@ describe('primary summary refusal fallback integration', () => {
     }
   });
 
+  it('persists an initial refusal partial text exactly once, never retries, and holds', async () => {
+    const membrane = new ScriptedMembrane([[refusalResponse([{ type: 'text', text: RETRY_OUTPUT_SENTINEL } as ContentBlock])]]);
+    const { framework, agent } = await createFrameworkFixture({ membrane });
+    try {
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 1);
+      const messages = chronicleMessages(agent);
+      assert.equal(countMessagesContaining(messages, RETRY_OUTPUT_SENTINEL), 1);
+      assert.equal(settlementMessages(agent, String(latestPrimaryRecord(framework).requestId)).length, 1);
+      const original = latestPrimaryRecord(framework);
+      assert.equal(original.finalStatus, 'held');
+      assert.equal(original.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+      assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('persists a retry refusal partial text exactly once, stops at two provider calls, and holds', async () => {
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [refusalResponse([{ type: 'text', text: RETRY_OUTPUT_SENTINEL } as ContentBlock])],
+    ]);
+    const { framework, agent, strategy } = await createFrameworkFixture({ membrane });
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'retry-partial');
+
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 2);
+      const messages = chronicleMessages(agent);
+      assert.equal(countMessagesContaining(messages, RETRY_OUTPUT_SENTINEL), 1);
+      const records = fallbackRecords(framework);
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.fallbackHeldReason, 'primary_summary_fallback_retry_partial_output');
+      assert.equal(retry.fallbackHeldReason, 'primary_summary_fallback_retry_partial_output');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('holds an initial thinking + tool_use refusal without executing tools and preserves provider block order', async () => {
+    const module = new EchoModule(() => false);
+    const refusalBlocks: ContentBlock[] = [
+      { type: 'thinking', thinking: 'initial reasoning', signature: 'sig-initial' } as ContentBlock,
+      { type: 'tool_use', id: 'call-initial', name: 'toolbox--echo', input: { message: TOOL_ARG_SENTINEL } } as ContentBlock,
+    ];
+    const membrane = new ScriptedMembrane([[refusalResponse(refusalBlocks)]]);
+    const { framework, agent } = await createFrameworkFixture({ membrane, modules: [module] });
+    try {
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 1);
+      assert.equal(module.calls.length, 0);
+      const requestId = String(latestPrimaryRecord(framework).requestId);
+      const settled = settlementMessages(agent, requestId);
+      assert.equal(settled.length, 2);
+      assert.deepEqual(settled[0]!.content.map((block) => block.type), ['thinking', 'tool_use']);
+      const placeholder = settled[1]!.content[0] as ContentBlock & { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean };
+      assert.equal(placeholder.type, 'tool_result');
+      assert.equal(placeholder.toolUseId, 'call-initial');
+      assert.equal(placeholder.content, NON_EXECUTED_TOOL_RESULT);
+      assert.equal(placeholder.isError, true);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('preserves all text before, between, and after refused tool_use blocks without silently dropping lived blocks', async () => {
+    const refusalBlocks: ContentBlock[] = [
+      { type: 'text', text: 'before' },
+      { type: 'thinking', thinking: 'reasoning', signature: 'sig-mixed' } as ContentBlock,
+      { type: 'tool_use', id: 'call-a', name: 'toolbox--echo', input: { message: 'A' } } as ContentBlock,
+      { type: 'text', text: 'between' },
+      { type: 'tool_use', id: 'call-b', name: 'toolbox--echo', input: { message: 'B' } } as ContentBlock,
+      { type: 'text', text: 'after' },
+    ];
+    const membrane = new ScriptedMembrane([[refusalResponse(refusalBlocks)]]);
+    const { framework, agent } = await createFrameworkFixture({ membrane });
+    try {
+      await enqueueAndDrain(framework);
+
+      const requestId = String(latestPrimaryRecord(framework).requestId);
+      const settled = settlementMessages(agent, requestId);
+      assert.equal(settled.length, 2);
+      assert.deepEqual(settled[0]!.content.map((block) => block.type), refusalBlocks.map((block) => block.type));
+      assert.equal(JSON.stringify(settled[0]!.content).includes('before'), true);
+      assert.equal(JSON.stringify(settled[0]!.content).includes('between'), true);
+      assert.equal(JSON.stringify(settled[0]!.content).includes('after'), true);
+      assert.equal((settled[1]!.content[0] as ContentBlock & { toolUseId: string }).toolUseId, 'call-a');
+      assert.equal((settled[1]!.content[1] as ContentBlock & { toolUseId: string }).toolUseId, 'call-b');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('executes earlier retry tool rounds exactly once but never executes the final refused tool_use round', async () => {
+    const module = new EchoModule(() => true);
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [toolRoundResponse(), refusalResponse([
+        { type: 'thinking', thinking: 'final reasoning', signature: 'sig-final' } as ContentBlock,
+        { type: 'text', text: RETRY_OUTPUT_SENTINEL } as ContentBlock,
+        { type: 'tool_use', id: 'call-final', name: 'toolbox--echo', input: { message: FINAL_TOOL_ARG_SENTINEL } } as ContentBlock,
+      ])],
+    ]);
+    const { framework, agent, strategy } = await createFrameworkFixture({ membrane, modules: [module] });
+    try {
+      const a = addSourcePair(agent, 'A');
+      seedSummary(strategy, 'L1-A', a);
+      addLatestPrompt(agent, 'baseline');
+      await persistHealthyBaseline(framework, agent);
+
+      const b = addSourcePair(agent, 'B');
+      seedSummary(strategy, 'L1-B', b);
+      addLatestPrompt(agent, 'final-refusal-after-tool');
+
+      await enqueueAndDrain(framework);
+
+      assert.equal(membrane.calls.length, 2);
+      assert.equal(module.calls.length, 1, 'only the successful earlier tool round may execute');
+      const messages = chronicleMessages(agent);
+      assert.equal(countMessagesContaining(messages, TOOL_RESULT_SENTINEL), 1, 'earlier tool result persists exactly once');
+      assert.equal(countMessagesContaining(messages, FINAL_TOOL_ARG_SENTINEL), 1, 'final refused tool_use persists exactly once');
+      const retry = fallbackRetryRecords(framework).at(-1)!;
+      const settled = settlementMessages(agent, String(retry.requestId));
+      assert.equal(settled.length, 2);
+      assert.deepEqual(settled[0]!.content.map((block) => block.type), ['thinking', 'text', 'tool_use']);
+      const placeholder = settled[1]!.content[0] as ContentBlock & { toolUseId: string; content: string };
+      assert.equal(placeholder.toolUseId, 'call-final');
+      assert.equal(placeholder.content, NON_EXECUTED_TOOL_RESULT);
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('holds a fallback retry instead of queueing a context-budget restart after a tool result', async () => {
     let frameworkRef: AgentFramework | null = null;
     const module = new EchoModule(() =>
@@ -839,6 +1119,226 @@ describe('primary summary refusal fallback integration', () => {
       );
     } finally {
       await framework.stop();
+    }
+  });
+
+  it('repairs a missing held placeholder on restart from the exact stored assistant settlement', async () => {
+    const requestId = 'repair-request';
+    const path = freshPath();
+    const first = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [manualPrimaryRecord({
+          requestId,
+          finalStatus: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+        })],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [
+          { type: 'thinking', thinking: 'repair reasoning', signature: 'sig-repair' } as ContentBlock,
+          { type: 'tool_use', id: 'repair-call', name: 'toolbox--echo', input: { message: FINAL_TOOL_ARG_SENTINEL } } as ContentBlock,
+        ],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 2,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+    } finally {
+      await first.framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      const settled = settlementMessages(restarted.agent, requestId);
+      assert.equal(settled.length, 2);
+      assert.equal(countMessagesContaining(settled, NON_EXECUTED_TOOL_RESULT), 1);
+      const record = latestPrimaryRecord(restarted.framework, ['baseline-request']);
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('finalizes an already-paired held settlement on restart without duplicating writes', async () => {
+    const requestId = 'paired-request';
+    const path = freshPath();
+    const first = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [manualPrimaryRecord({
+          requestId,
+          finalStatus: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+        })],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [{ type: 'tool_use', id: 'paired-call', name: 'toolbox--echo', input: { message: FINAL_TOOL_ARG_SENTINEL } } as ContentBlock],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 2,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+      first.agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'tool_result', toolUseId: 'paired-call', content: NON_EXECUTED_TOOL_RESULT, isError: true } as ContentBlock],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 1,
+          entryCount: 2,
+          role: 'user',
+          kind: 'generated_tool_result',
+        }),
+      );
+    } finally {
+      await first.framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      const settled = settlementMessages(restarted.agent, requestId);
+      assert.equal(settled.length, 2);
+      assert.equal(countMessagesContaining(settled, NON_EXECUTED_TOOL_RESULT), 1);
+      const record = latestPrimaryRecord(restarted.framework, ['baseline-request']);
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('does not let a historical identical block sequence satisfy a different request settlement', async () => {
+    const path = freshPath();
+    const first = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [
+          manualPrimaryRecord({
+            requestId: 'historical-request',
+            finalStatus: 'held',
+            fallbackHeldReason: 'primary_summary_refusal_partial_output',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+          }),
+          manualPrimaryRecord({
+            requestId: 'current-request',
+            finalStatus: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+          }),
+        ],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [{ type: 'text', text: RETRY_OUTPUT_SENTINEL }],
+        settlementMetadata({
+          requestId: 'historical-request',
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 1,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+    } finally {
+      await first.framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      assert.equal(settlementMessages(restarted.agent, 'current-request').length, 0);
+      const current = fallbackRecords(restarted.framework).find((record) => record.requestId === 'current-request')!;
+      assert.equal(current.finalStatus, 'held');
+      assert.equal(current.fallbackHeldReason, 'primary_summary_request_unresolved_on_restart');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('fails closed on restart when settlement metadata branch generation mismatches the request record', async () => {
+    const requestId = 'branch-mismatch-request';
+    const path = freshPath();
+    const first = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [manualPrimaryRecord({ requestId, finalStatus: 'refusal', branchGeneration: 2 })],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [{ type: 'text', text: RETRY_OUTPUT_SENTINEL }],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          branchGeneration: 1,
+          entryIndex: 0,
+          entryCount: 1,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+    } finally {
+      await first.framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({ path, membrane: new ScriptedMembrane([]) });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      const current = fallbackRecords(restarted.framework).find((record) => record.requestId === requestId)!;
+      assert.equal(current.finalStatus, 'held');
+      assert.equal(current.fallbackHeldReason, 'primary_summary_settlement_branch_mismatch_on_restart');
+      assert.equal(settlementMessages(restarted.agent, requestId).length, 1, 'restart must not rewrite or finalize against the wrong branch generation');
+    } finally {
+      await restarted.framework.stop();
     }
   });
 

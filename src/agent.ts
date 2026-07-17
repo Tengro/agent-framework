@@ -2,6 +2,7 @@ import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, Yiel
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { canonicalJsonStringify } from './canonical-json.js';
 
 export interface ActivationCompileArtifacts {
   compileResult: CompileResult;
@@ -215,7 +216,7 @@ export class Agent {
   }
 
   private hashJson(value: unknown): string {
-    return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+    return createHash('sha256').update(canonicalJsonStringify(value), 'utf8').digest('hex');
   }
 
   private primarySummaryFallbackEnabled(): boolean {
