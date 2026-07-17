@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import type { PrimarySummaryIdentity, PrimarySummaryProjection } from '@animalabs/context-manager';
+import type { Module } from '../src/index.js';
 
 import { AgentFramework } from '../src/index.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
@@ -89,6 +90,15 @@ function refusalResponse(content: ContentBlock[] = []): NormalizedResponse {
   } as unknown as NormalizedResponse;
 }
 
+function toolUseBlock(id = 'tool-1', message = 'hello'): ContentBlock {
+  return {
+    type: 'tool_use',
+    id,
+    name: 'echo',
+    input: { message },
+  } as ContentBlock;
+}
+
 class ScriptedMembrane {
   readonly calls: NormalizedRequest[] = [];
 
@@ -132,7 +142,11 @@ class LazyStream implements YieldingStream {
   }
 }
 
-async function createFramework(mem: ScriptedMembrane, refusalHandling?: Record<string, unknown>) {
+async function createFramework(
+  mem: ScriptedMembrane,
+  refusalHandling?: Record<string, unknown>,
+  modules: Module[] = [],
+) {
   const dir = mkdtempSync(join(tmpdir(), 'af-primary-summary-fallback-'));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'),
@@ -143,7 +157,7 @@ async function createFramework(mem: ScriptedMembrane, refusalHandling?: Record<s
       systemPrompt: 'system',
       refusalHandling,
     }],
-    modules: [],
+    modules,
   });
   const agent = framework.getAgent('assistant')!;
   return { dir, framework, agent };
@@ -359,6 +373,86 @@ describe('primary summary refusal fallback', () => {
       const held = fallbackState(framework).requests[0]!;
       assert.equal(held.finalStatus, 'held');
       assert.equal(held.fallbackHeldReason, 'primary_summary_refusal_no_compatible_healthy_baseline');
+      assert.deepEqual(
+        framework.healthSnapshot().primarySummaryFallback,
+        { requests: 1, pendingDispatches: 0, unresolvedIntents: 0, held: 1 },
+      );
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds instead of retrying when no newly admitted summaries exist', async () => {
+    const membrane = new ScriptedMembrane([[refusalResponse()]]);
+    const { dir, framework, agent } = await createFramework(membrane, {
+      primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
+    });
+    try {
+      const baselineRequest = request('system', 'baseline');
+      const baselineArtifacts = artifacts('shared', ['L1-1']);
+      await persistHealthyBaseline(framework, agent, baselineRequest, baselineArtifacts);
+      const currentRequest = request('system', 'latest input');
+      const currentArtifacts = artifacts('shared', ['L1-1']);
+      (agent as unknown as {
+        prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+        getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+      }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+      (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+        () => branchInfo();
+
+      await (framework as unknown as {
+        startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+      }).startAgentStream(agent, {
+        agentName: 'assistant',
+        reason: 'test',
+        source: 'test',
+        timestamp: Date.now(),
+      });
+      await waitForStream(framework, 'assistant');
+
+      const record = fallbackState(framework).requests.find((entry) => entry.requestId !== 'baseline-request')!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_no_newly_admitted_candidates');
+      assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds instead of retrying when newly admitted summaries exceed the configured maximum', async () => {
+    const membrane = new ScriptedMembrane([[refusalResponse()]]);
+    const { dir, framework, agent } = await createFramework(membrane, {
+      primarySummaryFallback: { enabled: true, maxNewSummaries: 1, requestBudgetTokens: 4096 },
+    });
+    try {
+      const baselineRequest = request('system', 'baseline');
+      const baselineArtifacts = artifacts('shared', ['L1-1']);
+      await persistHealthyBaseline(framework, agent, baselineRequest, baselineArtifacts);
+      const currentRequest = request('system', 'latest input');
+      const currentArtifacts = artifacts('shared', ['L1-1', 'L1-2', 'L1-3']);
+      (agent as unknown as {
+        prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+        getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+      }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+      (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+        () => branchInfo();
+
+      await (framework as unknown as {
+        startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+      }).startAgentStream(agent, {
+        agentName: 'assistant',
+        reason: 'test',
+        source: 'test',
+        timestamp: Date.now(),
+      });
+      await waitForStream(framework, 'assistant');
+
+      const record = fallbackState(framework).requests.find((entry) => entry.requestId !== 'baseline-request')!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_too_many_candidates');
+      assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -367,6 +461,55 @@ describe('primary summary refusal fallback', () => {
 
   it('holds instead of retrying for partial text output', async () => {
     const membrane = new ScriptedMembrane([[refusalResponse([{ type: 'text', text: 'partial' }])]]);
+    const { dir, framework, agent } = await createFramework(membrane, {
+      primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
+    });
+    try {
+      const baselineRequest = request('system', 'baseline');
+      const baselineArtifacts = artifacts('shared', ['L1-1']);
+      await persistHealthyBaseline(framework, agent, baselineRequest, baselineArtifacts);
+      const currentRequest = request('system', 'latest input');
+      currentRequest.tools = [{
+        name: 'echo-module--echo',
+        description: 'Echoes the input',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            message: { type: 'string' },
+          },
+          required: ['message'],
+        },
+      }];
+      const currentArtifacts = artifacts('shared', ['L1-1', 'L1-2']);
+      (agent as unknown as {
+        prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+        getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+      }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+      (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+        () => branchInfo();
+
+      await (framework as unknown as {
+        startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+      }).startAgentStream(agent, {
+        agentName: 'assistant',
+        reason: 'test',
+        source: 'test',
+        timestamp: Date.now(),
+      });
+      await waitForStream(framework, 'assistant');
+
+      const record = fallbackState(framework).requests.find((entry) => entry.requestId !== 'baseline-request')!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+      assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds instead of retrying for refusal content that includes a tool block', async () => {
+    const membrane = new ScriptedMembrane([[refusalResponse([toolUseBlock('tool-partial', 'partial tool')])]]);
     const { dir, framework, agent } = await createFramework(membrane, {
       primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
     });
@@ -420,6 +563,48 @@ describe('primary summary refusal fallback', () => {
       }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
       (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
         () => branchInfo('branch-a');
+
+      await (framework as unknown as {
+        startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+      }).startAgentStream(agent, {
+        agentName: 'assistant',
+        reason: 'test',
+        source: 'test',
+        timestamp: Date.now(),
+      });
+      await waitForStream(framework, 'assistant');
+
+      const record = fallbackState(framework).requests.find((entry) => entry.requestId !== 'baseline-request')!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_no_compatible_healthy_baseline');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats system or tool contract changes as incompatible', async () => {
+    const membrane = new ScriptedMembrane([[refusalResponse()]]);
+    const { dir, framework, agent } = await createFramework(membrane, {
+      primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
+    });
+    try {
+      const baselineRequest = request('system', 'baseline');
+      const baselineArtifacts = artifacts('shared', ['L1-1']);
+      await persistHealthyBaseline(framework, agent, baselineRequest, baselineArtifacts);
+      const currentRequest = request('system', 'latest input');
+      currentRequest.tools = [{
+        name: 'echo',
+        description: 'Echoes',
+        inputSchema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'] },
+      }];
+      const currentArtifacts = artifacts('changed', ['L1-1', 'L1-2']);
+      (agent as unknown as {
+        prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+        getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+      }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+      (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+        () => branchInfo();
 
       await (framework as unknown as {
         startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
@@ -549,6 +734,72 @@ describe('primary summary refusal fallback', () => {
       assert.equal(secondMembrane.calls.length, 0);
     } finally {
       await second.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds after a fallback retry refuses and never dispatches a second retry', async () => {
+    const membrane = new ScriptedMembrane([
+      [refusalResponse()],
+      [refusalResponse()],
+    ]);
+    const { dir, framework, agent } = await createFramework(membrane, {
+      primarySummaryFallback: { enabled: true, maxNewSummaries: 4, requestBudgetTokens: 4096 },
+    });
+    try {
+      const baselineRequest = request('system', 'baseline');
+      const baselineArtifacts = artifacts('shared', ['L1-1']);
+      await persistHealthyBaseline(framework, agent, baselineRequest, baselineArtifacts);
+
+      const currentRequest = request('system', 'latest input');
+      const currentArtifacts = artifacts('shared', ['L1-1', 'L1-2']);
+      const retryRequest = request('system', 'expanded raw source');
+      (agent as unknown as {
+        prepareActivationRequest: () => Promise<{ request: NormalizedRequest; artifacts: typeof currentArtifacts }>;
+        buildPrimarySummaryRawExpansionRequest: (
+          artifacts: typeof currentArtifacts,
+          summaries: ReadonlyArray<PrimarySummaryIdentity>,
+        ) => { request: NormalizedRequest; artifacts: typeof currentArtifacts };
+        getCurrentBranchGeneration: () => ReturnType<typeof branchInfo>;
+      }).prepareActivationRequest = async () => ({ request: currentRequest, artifacts: currentArtifacts });
+      (agent as unknown as {
+        buildPrimarySummaryRawExpansionRequest: (
+          artifacts: typeof currentArtifacts,
+          summaries: ReadonlyArray<PrimarySummaryIdentity>,
+        ) => { request: NormalizedRequest; artifacts: typeof currentArtifacts };
+      }).buildPrimarySummaryRawExpansionRequest = () => ({ request: retryRequest, artifacts: currentArtifacts });
+      (agent as unknown as { getCurrentBranchGeneration: () => ReturnType<typeof branchInfo> }).getCurrentBranchGeneration =
+        () => branchInfo();
+
+      const start = (framework as unknown as {
+        startAgentStream: (agent: object, trigger: Record<string, unknown>) => Promise<void>;
+        pendingRequests: Array<Record<string, unknown>>;
+      }).startAgentStream.bind(framework);
+      const trigger = {
+        agentName: 'assistant',
+        reason: 'test',
+        source: 'test',
+        timestamp: Date.now(),
+      };
+      await start(agent, trigger);
+      await waitForStream(framework, 'assistant');
+
+      const queuedRetry = (framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests.shift();
+      assert.ok(queuedRetry);
+      await start(agent, queuedRetry!);
+      await waitForStream(framework, 'assistant');
+
+      assert.equal(membrane.calls.length, 2);
+      assert.equal((framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests.length, 0);
+      const records = fallbackState(framework).requests;
+      const original = records.find((record) => record.requestId !== 'baseline-request' && record.dispatchKind === 'primary')!;
+      const retry = records.find((record) => record.dispatchKind === 'primary_summary_fallback_retry')!;
+      assert.equal(original.fallbackStatus, 'held');
+      assert.equal(original.fallbackHeldReason, 'primary_summary_fallback_retry_refusal');
+      assert.equal(retry.finalStatus, 'held');
+      assert.equal(retry.fallbackHeldReason, 'primary_summary_fallback_retry_refusal');
+    } finally {
+      await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
   });
