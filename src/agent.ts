@@ -263,6 +263,15 @@ export class Agent {
     return manager.expandPrimarySummaryProjectionRaw(compiled, summaries);
   }
 
+  private primarySummaryIdentityKey(identity: PrimarySummaryIdentity): string {
+    return [
+      identity.id,
+      identity.contentHash,
+      identity.carrierHash,
+      identity.sourceLeafHash,
+    ].join('\u0000');
+  }
+
   private buildRequestFromCompileResult(
     compileResult: CompileResult,
     availableTools: ToolDefinition[],
@@ -384,10 +393,20 @@ export class Agent {
     availableTools: ToolDefinition[],
   ): { request: NormalizedRequest; artifacts: ActivationCompileArtifacts } {
     this.setPrimaryLaneContract(artifacts.contract);
-    const compileResult = this.expandPrimarySummaryProjectionRaw(
-      artifacts.compileResult,
-      summaries,
+    const alreadyExpanded = new Set(
+      artifacts.compileResult.primarySummaryProjection?.selectedSummaries
+        .filter((selection) => selection.renderedAs === 'raw_expansion')
+        .map((selection) => this.primarySummaryIdentityKey(selection.identity)) ?? [],
     );
+    const expandable = summaries.filter((summary) =>
+      !alreadyExpanded.has(this.primarySummaryIdentityKey(summary)),
+    );
+    const compileResult = expandable.length > 0
+      ? this.expandPrimarySummaryProjectionRaw(
+          artifacts.compileResult,
+          expandable,
+        )
+      : artifacts.compileResult;
     return {
       request: this.buildRequestFromCompileResult(compileResult, availableTools),
       artifacts: {

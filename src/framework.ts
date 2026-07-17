@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type {
@@ -11,6 +11,7 @@ import type {
   MessageMetadata,
   MessageQuery,
   MessageQueryResult,
+  PrimarySummaryContract,
   PrimarySummaryIdentity,
   PrimarySummaryProjection,
   StoredMessage,
@@ -172,6 +173,26 @@ interface PrimarySummaryFallbackIntentRecord {
   retryRequestHash: string;
   retryCompleteBoundTokens: number;
   requestBudgetTokens: number;
+  retryRequestId?: string;
+  dispatchedAt?: number;
+  quarantinePersistedAt?: number;
+  outputs?: PrimarySummaryFallbackOutputRecord[];
+  toolDispatches?: PrimarySummaryFallbackToolDispatchRecord[];
+  finalizedAt?: number;
+}
+
+interface PrimarySummaryFallbackOutputRecord {
+  phase: string;
+  contentHash: string;
+  messageId: string;
+  blockTypes: string[];
+  persistedAt: number;
+}
+
+interface PrimarySummaryFallbackToolDispatchRecord {
+  callId: string;
+  inputHash: string;
+  recordedAt: number;
 }
 
 interface PrimarySummaryRequestRecord {
@@ -1598,6 +1619,16 @@ export class AgentFramework {
       const state = this.readPrimarySummaryFallbackState();
       let changed = false;
       state.requests = state.requests.map((record) => {
+        if (record.dispatchKind === 'primary_summary_fallback_retry' && record.finalStatus === 'pending') {
+          changed = true;
+          const reason = 'primary_summary_fallback_unresolved_on_restart';
+          alerts.push({ agentName: record.agentName, requestId: record.requestId, reason });
+          return {
+            ...record,
+            finalStatus: 'held',
+            fallbackHeldReason: reason,
+          };
+        }
         if (record.finalStatus === 'pending') {
           changed = true;
           const reason = 'primary_summary_request_unresolved_on_restart';
@@ -1684,6 +1715,8 @@ export class AgentFramework {
       if (candidate.systemHash !== current.systemHash) continue;
       if (candidate.modelConfigHash !== current.modelConfigHash) continue;
       if (candidate.toolContractHash !== current.toolContractHash) continue;
+      if (candidate.dispatchKind !== 'primary') continue;
+      if (candidate.fallbackIntent || candidate.fallbackStatus) continue;
       if (candidate.finalStatus !== 'success') continue;
       return candidate;
     }
@@ -1711,6 +1744,340 @@ export class AgentFramework {
       this.writePrimarySummaryFallbackState({ requests: state.requests.slice(-256) });
       return state.requests[index]!;
     });
+  }
+
+  private async getPrimarySummaryRequestRecord(requestId: string): Promise<PrimarySummaryRequestRecord | null> {
+    return this.withPrimarySummaryStateLock(() => {
+      const state = this.readPrimarySummaryFallbackState();
+      return state.requests.find((entry) => entry.requestId === requestId) ?? null;
+    });
+  }
+
+  private primarySummaryContractsMatch(
+    left: PrimarySummaryContract & { systemHash: string },
+    right: PrimarySummaryContract & { systemHash: string },
+  ): boolean {
+    return left.systemHash === right.systemHash
+      && left.modelConfigHash === right.modelConfigHash
+      && left.toolContractHash === right.toolContractHash;
+  }
+
+  private primarySummaryFallbackOutputPhaseHash(blocks: ReadonlyArray<ContentBlock>): string {
+    return this.hashJson(blocks);
+  }
+
+  private primarySummaryFallbackBlockTypes(blocks: ReadonlyArray<ContentBlock>): string[] {
+    return blocks.map((block) => block.type);
+  }
+
+  private summarizePrimarySummaryRetryRequest(request: NormalizedRequest): Record<string, unknown> {
+    const blockCounts = new Map<string, number>();
+    for (const message of request.messages) {
+      for (const block of message.content) {
+        blockCounts.set(block.type, (blockCounts.get(block.type) ?? 0) + 1);
+      }
+    }
+    return {
+      kind: 'primary_summary_fallback_retry',
+      requestHash: this.hashJson(request),
+      systemHash: this.hashJson(request.system ?? ''),
+      messageCount: request.messages.length,
+      toolCount: request.tools?.length ?? 0,
+      participantCount: [...new Set(request.messages.map((message) => message.participant))].length,
+      blockCounts: Object.fromEntries([...blockCounts.entries()].sort(([left], [right]) => left.localeCompare(right))),
+      promptCaching: request.promptCaching === true,
+      cacheTtl: request.cacheTtl,
+      assistantParticipant: request.assistantParticipant,
+      requestCompleteBoundTokens: this.estimateRequestCompleteBoundTokens(request),
+    };
+  }
+
+  private summarizePrimarySummaryRetryResponse(response: NormalizedResponse): Record<string, unknown> {
+    const blockCounts = new Map<string, number>();
+    for (const block of response.content) {
+      blockCounts.set(block.type, (blockCounts.get(block.type) ?? 0) + 1);
+    }
+    return {
+      kind: 'primary_summary_fallback_retry',
+      stopReason: response.stopReason,
+      rawAssistantTextHash: response.rawAssistantText
+        ? this.hashJson(response.rawAssistantText)
+        : undefined,
+      blockCounts: Object.fromEntries([...blockCounts.entries()].sort(([left], [right]) => left.localeCompare(right))),
+      toolCallIds: response.toolCalls.map((call: { id: string }) => call.id),
+      usage: response.usage
+        ? {
+            inputTokens: response.usage.inputTokens,
+            outputTokens: response.usage.outputTokens,
+          }
+        : undefined,
+    };
+  }
+
+  private async claimPrimarySummaryRetryIntent(
+    originalRequestId: string,
+    intentId: string,
+    retryRequestId: string,
+  ): Promise<'claimed' | 'duplicate' | 'missing'> {
+    let outcome: 'claimed' | 'duplicate' | 'missing' = 'missing';
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId || record.fallbackStatus !== 'pending') {
+        return record;
+      }
+      if (intent.retryRequestId && intent.retryRequestId !== retryRequestId) {
+        outcome = 'duplicate';
+        return record;
+      }
+      outcome = 'claimed';
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          retryRequestId,
+          dispatchedAt: intent.dispatchedAt ?? Date.now(),
+        },
+      };
+    });
+    return outcome;
+  }
+
+  private async validatePrimarySummaryRetryMutation(
+    agent: Agent,
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+    compiledRequest: NormalizedRequest,
+    artifacts: ActivationCompileArtifacts,
+    phase: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string; data: Record<string, unknown> }> {
+    const branch = agent.getCurrentBranchGeneration();
+    if (!branch || branch.id !== retryDispatch.branch.id || branch.generation !== retryDispatch.branch.generation) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_branch_changed_${phase}`,
+        data: {
+          expectedBranchId: retryDispatch.branch.id,
+          expectedGeneration: retryDispatch.branch.generation,
+          actualBranchId: branch?.id,
+          actualGeneration: branch?.generation,
+        },
+      };
+    }
+    const requestHash = this.hashJson(compiledRequest);
+    if (requestHash !== retryDispatch.expectedRetryRequestHash) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_request_changed_${phase}`,
+        data: {
+          expectedRetryRequestHash: retryDispatch.expectedRetryRequestHash,
+          actualRetryRequestHash: requestHash,
+        },
+      };
+    }
+    if (
+      this.primarySummaryProjectionKeys(artifacts.compileResult.primarySummaryProjection ?? null).join('\u0000') !==
+      retryDispatch.originalProjectionKeys.join('\u0000')
+    ) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_projection_changed_${phase}`,
+        data: {
+          expectedProjectionKeys: retryDispatch.originalProjectionKeys,
+          actualProjectionKeys: this.primarySummaryProjectionKeys(
+            artifacts.compileResult.primarySummaryProjection ?? null,
+          ),
+        },
+      };
+    }
+    if (!this.primarySummaryContractsMatch(artifacts.contract, retryDispatch.originalArtifacts.contract)) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_contract_changed_${phase}`,
+        data: {
+          expectedContract: retryDispatch.originalArtifacts.contract,
+          actualContract: artifacts.contract,
+        },
+      };
+    }
+    const original = await this.getPrimarySummaryRequestRecord(retryDispatch.originalRequestId);
+    if (
+      !original?.fallbackIntent ||
+      original.fallbackIntent.intentId !== retryDispatch.intentId ||
+      original.fallbackIntent.retryRequestId !== requestId ||
+      original.fallbackStatus !== 'pending'
+    ) {
+      return {
+        ok: false,
+        reason: `primary_summary_fallback_intent_changed_${phase}`,
+        data: {
+          expectedIntentId: retryDispatch.intentId,
+          actualIntentId: original?.fallbackIntent?.intentId,
+          retryRequestId: original?.fallbackIntent?.retryRequestId,
+          fallbackStatus: original?.fallbackStatus,
+        },
+      };
+    }
+    return { ok: true };
+  }
+
+  private async recordPrimarySummaryRetryQuarantine(
+    originalRequestId: string,
+    intentId: string,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId || intent.quarantinePersistedAt) return record;
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          quarantinePersistedAt: Date.now(),
+        },
+      };
+    });
+  }
+
+  private async recordPrimarySummaryRetryOutput(
+    originalRequestId: string,
+    intentId: string,
+    output: PrimarySummaryFallbackOutputRecord,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId) return record;
+      const existing = intent.outputs?.find((entry) => entry.phase === output.phase);
+      if (
+        existing &&
+        existing.contentHash === output.contentHash &&
+        existing.messageId === output.messageId
+      ) {
+        return record;
+      }
+      if (existing) {
+        throw new Error(`Primary summary fallback output phase '${output.phase}' changed after persistence`);
+      }
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          outputs: [...(intent.outputs ?? []), output],
+        },
+      };
+    });
+  }
+
+  private async recordPrimarySummaryRetryToolDispatch(
+    originalRequestId: string,
+    intentId: string,
+    call: ToolCall,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      if (!intent || intent.intentId !== intentId) return record;
+      const inputHash = this.hashJson(call.input);
+      const existing = intent.toolDispatches?.find((entry) => entry.callId === call.id);
+      if (existing?.inputHash === inputHash) return record;
+      if (existing) {
+        throw new Error(`Primary summary fallback tool dispatch '${call.id}' changed after persistence`);
+      }
+      return {
+        ...record,
+        fallbackIntent: {
+          ...intent,
+          toolDispatches: [
+            ...(intent.toolDispatches ?? []),
+            {
+              callId: call.id,
+              inputHash,
+              recordedAt: Date.now(),
+            },
+          ],
+        },
+      };
+    });
+  }
+
+  private async markPrimarySummaryRetrySuccess(
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+    stopReason: string | undefined,
+    providerInputTokens: number | undefined,
+    visibleAssistantOutput: boolean,
+    executedToolCalls: number,
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      stopReason,
+      providerInputTokens,
+      visibleAssistantOutput,
+      executedToolCalls,
+      finalStatus: 'success',
+      fallbackHeldReason: undefined,
+    }));
+    await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => {
+      const intent = record.fallbackIntent;
+      return {
+        ...record,
+        finalStatus: 'success',
+        fallbackStatus: 'success',
+        fallbackHeldReason: undefined,
+        fallbackIntent: intent && intent.intentId === retryDispatch.intentId
+          ? { ...intent, finalizedAt: Date.now() }
+          : intent,
+      };
+    });
+  }
+
+  private async holdPrimarySummaryRetryFamily(
+    agent: Agent,
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+    reason: string,
+    data?: Record<string, unknown>,
+    options?: { emitChronicleMarker?: boolean; stopReason?: string },
+  ): Promise<void> {
+    await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+      ...record,
+      ...(options?.stopReason ? { stopReason: options.stopReason } : {}),
+      finalStatus: 'held',
+      fallbackHeldReason: reason,
+    }));
+    await this.updatePrimarySummaryRequestRecord(retryDispatch.originalRequestId, (record) => ({
+      ...record,
+      finalStatus: 'held',
+      fallbackStatus: 'held',
+      fallbackHeldReason: reason,
+    }));
+    this.opsAlert('refusal-held', agent.name, reason, { data });
+    if (options?.emitChronicleMarker === false) return;
+    try {
+      agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text:
+            `[refusal-held] Your previous turn was refused by the provider and ` +
+            `is being held for operator review rather than silently retried. ` +
+            `Automatic raw-expansion recovery was either unsafe or unsuccessful.`,
+        }],
+        { system: true, kind: 'refusal-held', reason },
+      );
+    } catch (error) {
+      console.error('[refusal-held] could not record chronicle marker:', error);
+    }
+  }
+
+  private async primarySummaryRetryAlreadySucceeded(
+    requestId: string,
+    retryDispatch: PrimarySummaryFallbackRetryDispatch,
+  ): Promise<boolean> {
+    const [retryRecord, originalRecord] = await Promise.all([
+      this.getPrimarySummaryRequestRecord(requestId),
+      this.getPrimarySummaryRequestRecord(retryDispatch.originalRequestId),
+    ]);
+    return retryRecord?.finalStatus === 'success'
+      || originalRecord?.fallbackStatus === 'success'
+      || originalRecord?.finalStatus === 'success';
   }
 
   private async holdPrimarySummaryRequest(
@@ -4134,6 +4501,28 @@ export class AgentFramework {
           this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
           return;
         }
+
+        const claim = await this.claimPrimarySummaryRetryIntent(
+          retryDispatch.originalRequestId,
+          retryDispatch.intentId,
+          requestId,
+        );
+        if (claim !== 'claimed') {
+          await this.holdPrimarySummaryRequest(
+            agent,
+            retryDispatch.originalRequestId,
+            claim === 'duplicate'
+              ? 'primary_summary_fallback_duplicate_retry_blocked'
+              : 'primary_summary_fallback_retry_intent_missing',
+            { intentId: retryDispatch.intentId, retryRequestId: requestId },
+          );
+          agent.reset();
+          this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+          return;
+        }
+
         if (
           !branch ||
           branch.id !== retryDispatch.branch.id ||
@@ -4319,12 +4708,20 @@ export class AgentFramework {
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       if (trigger?.primarySummaryFallbackRetry) {
+        await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
+          ...record,
+          finalStatus: 'held',
+          fallbackHeldReason: err.message,
+        }));
         await this.updatePrimarySummaryRequestRecord(trigger.primarySummaryFallbackRetry.originalRequestId, (record) => ({
           ...record,
+          finalStatus: 'held',
           fallbackStatus: 'held',
           fallbackHeldReason: err.message,
         }));
-        this.opsAlert('refusal-held', agent.name, err.message);
+        this.opsAlert('refusal-held', agent.name, err.message, {
+          data: { requestId, originalRequestId: trigger.primarySummaryFallbackRetry.originalRequestId },
+        });
         agent.reset();
         this.settleAgent(agent.name, {
           stopReason: 'completed',
@@ -4389,6 +4786,10 @@ export class AgentFramework {
     const primarySummaryConfig = this.primarySummaryFallbackConfig(agent);
     const primarySummaryRetry = trigger?.primarySummaryFallbackRetry;
     let primarySummaryQuarantinePersisted = false;
+    const fallbackRetryRequestForLog =
+      primarySummaryRetry && compiledRequest
+        ? this.summarizePrimarySummaryRetryRequest(compiledRequest)
+        : compiledRequest ?? { note: 'streaming request' };
 
     // ---- Present-while-acting turn state ---------------------------------
     // Output locus for the current CONVERSATIONAL ROUND: resolved lazily and
@@ -4471,33 +4872,93 @@ export class AgentFramework {
 
     const persistPrimarySummaryRetryQuarantine = async (): Promise<boolean> => {
       if (!primarySummaryRetry || primarySummaryQuarantinePersisted || !artifacts) return true;
+      const validation = await this.validatePrimarySummaryRetryMutation(
+        agent,
+        requestId,
+        primarySummaryRetry,
+        compiledRequest!,
+        artifacts,
+        'before_quarantine',
+      );
+      if (!validation.ok) {
+        await this.holdPrimarySummaryRetryFamily(
+          agent,
+          requestId,
+          primarySummaryRetry,
+          validation.reason,
+          validation.data,
+          { emitChronicleMarker: false },
+        );
+        stream.cancel();
+        agent.reset();
+        this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+        return false;
+      }
       try {
         await agent.getContextManager().quarantinePrimarySummaryForPrimaryLane(
           artifacts.contract,
           primarySummaryRetry.candidateSummaries,
         );
         primarySummaryQuarantinePersisted = true;
-        await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
-          ...record,
-          fallbackStatus: 'success',
-          fallbackHeldReason: undefined,
-        }));
+        await this.recordPrimarySummaryRetryQuarantine(
+          primarySummaryRetry.originalRequestId,
+          primarySummaryRetry.intentId,
+        );
         return true;
       } catch (error) {
         const reason = 'primary_summary_fallback_quarantine_failed';
-        await this.holdPrimarySummaryRequest(agent, requestId, reason, {
+        await this.holdPrimarySummaryRetryFamily(agent, requestId, primarySummaryRetry, reason, {
           error: error instanceof Error ? error.message : String(error),
         });
-        await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
-          ...record,
-          fallbackStatus: 'held',
-          fallbackHeldReason: reason,
-        }));
         stream.cancel();
         agent.reset();
         this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
         return false;
       }
+    };
+
+    const persistPrimarySummaryRetryOutput = async (
+      phase: string,
+      blocks: ContentBlock[],
+      participant = agent.name,
+    ): Promise<boolean> => {
+      if (!primarySummaryRetry || !artifacts) return true;
+      if (blocks.length === 0) return true;
+      const validation = await this.validatePrimarySummaryRetryMutation(
+        agent,
+        requestId,
+        primarySummaryRetry,
+        compiledRequest!,
+        artifacts,
+        `before_${phase}`,
+      );
+      if (!validation.ok) {
+        await this.holdPrimarySummaryRetryFamily(
+          agent,
+          requestId,
+          primarySummaryRetry,
+          validation.reason,
+          validation.data,
+          { emitChronicleMarker: false },
+        );
+        stream.cancel();
+        agent.reset();
+        this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+        return false;
+      }
+      const messageId = agent.getContextManager().addMessage(participant, blocks);
+      await this.recordPrimarySummaryRetryOutput(
+        primarySummaryRetry.originalRequestId,
+        primarySummaryRetry.intentId,
+        {
+          phase,
+          contentHash: this.primarySummaryFallbackOutputPhaseHash(blocks),
+          messageId,
+          blockTypes: this.primarySummaryFallbackBlockTypes(blocks),
+          persistedAt: Date.now(),
+        },
+      );
+      return true;
     };
 
     try {
@@ -4571,10 +5032,47 @@ export class AgentFramework {
               return;
             }
 
+            if (primarySummaryRetry) {
+              const phase = `tool_round_${event.context.depth ?? 0}`;
+              if (!(await persistPrimarySummaryRetryOutput(phase, assistantBlocks))) {
+                return;
+              }
+              this.pendingAssistantBlocks.delete(agent.name);
+            }
+
             executedToolCalls += event.calls.length;
             this.recordEphemeralToolCalls(agent.name, event.calls.length);
 
             for (const call of event.calls) {
+              if (primarySummaryRetry) {
+                const validation = await this.validatePrimarySummaryRetryMutation(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  compiledRequest!,
+                  artifacts!,
+                  `before_tool_dispatch_${call.id}`,
+                );
+                if (!validation.ok) {
+                  await this.holdPrimarySummaryRetryFamily(
+                    agent,
+                    requestId,
+                    primarySummaryRetry,
+                    validation.reason,
+                    validation.data,
+                    { emitChronicleMarker: false },
+                  );
+                  stream.cancel();
+                  agent.reset();
+                  this.settleAgent(agent.name, { stopReason: 'completed', speech: '' });
+                  return;
+                }
+                await this.recordPrimarySummaryRetryToolDispatch(
+                  primarySummaryRetry.originalRequestId,
+                  primarySummaryRetry.intentId,
+                  call,
+                );
+              }
               this.dispatchToolCall(agent.name, call);
             }
 
@@ -4711,12 +5209,13 @@ export class AgentFramework {
                   : executedToolCalls > 0
                     ? 'primary_summary_fallback_retry_tool_already_executed'
                     : 'primary_summary_fallback_retry_refusal';
-                await this.holdPrimarySummaryRequest(agent, requestId, reason, holdReasonData);
-                await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
-                  ...record,
-                  fallbackStatus: 'held',
-                  fallbackHeldReason: reason,
-                }));
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  reason,
+                  holdReasonData,
+                );
               } else if (visibleAssistantOutput || executedToolCalls > 0 || !currentRecord?.projection) {
                 const reason = visibleAssistantOutput
                   ? 'primary_summary_refusal_partial_output'
@@ -4851,10 +5350,22 @@ export class AgentFramework {
             // thinking to precede tool_use in the same assistant turn).
             if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                agent.addAssistantResponse(terminalContent);
+                if (primarySummaryRetry) {
+                  if (!(await persistPrimarySummaryRetryOutput('terminal', terminalContent))) {
+                    return;
+                  }
+                } else {
+                  agent.addAssistantResponse(terminalContent);
+                }
               }
             } else {
-              agent.addAssistantResponse(terminalContent);
+              if (primarySummaryRetry) {
+                if (!(await persistPrimarySummaryRetryOutput('terminal', terminalContent))) {
+                  return;
+                }
+              } else {
+                agent.addAssistantResponse(terminalContent);
+              }
             }
 
             // Run afterInference hooks (no-op if no MCPL servers)
@@ -4916,20 +5427,46 @@ export class AgentFramework {
                 }
               : undefined;
 
+            if (primarySummaryRetry && artifacts) {
+              const validation = await this.validatePrimarySummaryRetryMutation(
+                agent,
+                requestId,
+                primarySummaryRetry,
+                compiledRequest!,
+                artifacts,
+                'before_success_markers',
+              );
+              if (!validation.ok) {
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  validation.reason,
+                  validation.data,
+                  { emitChronicleMarker: false },
+                );
+                return;
+              }
+            }
+
             if (primarySummaryConfig.enabled) {
-              await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
-                ...record,
-                stopReason: response.stopReason,
-                providerInputTokens,
-                visibleAssistantOutput,
-                executedToolCalls,
-                finalStatus: 'success',
-              }));
               if (primarySummaryRetry) {
-                await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
+                await this.markPrimarySummaryRetrySuccess(
+                  requestId,
+                  primarySummaryRetry,
+                  response.stopReason,
+                  providerInputTokens,
+                  visibleAssistantOutput,
+                  executedToolCalls,
+                );
+              } else {
+                await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
                   ...record,
-                  fallbackStatus: 'success',
-                  fallbackHeldReason: undefined,
+                  stopReason: response.stopReason,
+                  providerInputTokens,
+                  visibleAssistantOutput,
+                  executedToolCalls,
+                  finalStatus: 'success',
                 }));
               }
             }
@@ -4972,8 +5509,10 @@ export class AgentFramework {
               agentName: agent.name,
               requestId,
               success: true,
-              request: compiledRequest ?? { note: 'streaming request' },
-              response: response.raw ?? { note: 'streaming response' },
+              request: fallbackRetryRequestForLog,
+              response: primarySummaryRetry
+                ? this.summarizePrimarySummaryRetryResponse(response)
+                : response.raw ?? { note: 'streaming response' },
               durationMs,
               tokenUsage,
               stopReason: response.stopReason,
@@ -5195,12 +5734,29 @@ export class AgentFramework {
               requestId,
               success: false,
               error: err.message,
-              request: compiledRequest ?? { note: 'streaming request failed' },
+              request: fallbackRetryRequestForLog,
               durationMs,
             });
 
             // Only reset + retry if this is still the active stream
             if (agent.streamId !== myStreamId) break;
+
+            if (primarySummaryRetry) {
+              await this.holdPrimarySummaryRetryFamily(
+                agent,
+                requestId,
+                primarySummaryRetry,
+                'primary_summary_fallback_retry_stream_error',
+                { error: err.message },
+              );
+              agent.reset();
+              this.eventGate?.onInferenceEnded(agent.name);
+              this.settleAgent(agent.name, {
+                stopReason: 'completed',
+                speech: '',
+              });
+              return;
+            }
 
             agent.reset();
 
@@ -5241,21 +5797,13 @@ export class AgentFramework {
             // reject an ephemeral's promise mid-run and bump the failure
             // streak). Gate release + stream teardown happen in `finally`.
             if (this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`)) {
-              if (primarySummaryRetry && !primarySummaryQuarantinePersisted) {
-                await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
-                  ...record,
-                  finalStatus: 'timeout_unknown',
-                  fallbackHeldReason: 'primary_summary_fallback_retry_cancelled_before_success',
-                }));
-                await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
-                  ...record,
-                  fallbackStatus: 'timeout_unknown',
-                  fallbackHeldReason: 'primary_summary_fallback_retry_cancelled_before_success',
-                }));
-                this.opsAlert(
-                  'refusal-held',
-                  agent.name,
+              if (primarySummaryRetry) {
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
                   'primary_summary_fallback_retry_cancelled_before_success',
+                  { frameworkCancelled: true },
                 );
               }
               this.eventGate?.onInferenceEnded(agent.name);
@@ -5266,23 +5814,39 @@ export class AgentFramework {
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
               const durationMs = Date.now() - startTime;
+              if (primarySummaryRetry) {
+                await this.holdPrimarySummaryRetryFamily(
+                  agent,
+                  requestId,
+                  primarySummaryRetry,
+                  `stream_aborted:${reason}`,
+                  { reason },
+                  { stopReason: 'abort' },
+                );
+                agent.reset();
+                this.eventGate?.onInferenceEnded(agent.name);
+                this.logInference({
+                  timestamp: startTime,
+                  agentName: agent.name,
+                  requestId,
+                  success: false,
+                  error: `Stream aborted: ${reason}`,
+                  request: fallbackRetryRequestForLog,
+                  durationMs,
+                });
+                this.settleAgent(agent.name, {
+                  stopReason: 'completed',
+                  speech: '',
+                });
+                return;
+              }
               if (primarySummaryConfig.enabled) {
                 await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
                   ...record,
                   stopReason: 'abort',
-                  finalStatus: primarySummaryRetry && !primarySummaryQuarantinePersisted
-                    ? 'timeout_unknown'
-                    : 'error',
+                  finalStatus: 'error',
                   fallbackHeldReason: `stream_aborted:${reason}`,
                 }));
-                if (primarySummaryRetry && !primarySummaryQuarantinePersisted) {
-                  await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
-                    ...record,
-                    fallbackStatus: 'timeout_unknown',
-                    fallbackHeldReason: `stream_aborted:${reason}`,
-                  }));
-                  this.opsAlert('refusal-held', agent.name, `stream_aborted:${reason}`);
-                }
               }
               agent.reset();
               this.settleAgent(agent.name, {
@@ -5307,7 +5871,7 @@ export class AgentFramework {
                 requestId,
                 success: false,
                 error: `Stream aborted: ${reason}`,
-                request: compiledRequest ?? { note: 'streaming request aborted' },
+                request: fallbackRetryRequestForLog,
                 durationMs,
               });
               this.eventGate?.onInferenceEnded(agent.name);
@@ -5359,22 +5923,38 @@ export class AgentFramework {
       // inference:exhausted so ephemeral agent promises can settle.
       const err = error instanceof Error ? error : new Error(String(error));
       const durationMs = Date.now() - startTime;
-      if (primarySummaryConfig.enabled) {
+      if (primarySummaryRetry) {
+        if (await this.primarySummaryRetryAlreadySucceeded(requestId, primarySummaryRetry)) {
+          this.logInference({
+            timestamp: startTime,
+            agentName: agent.name,
+            requestId,
+            success: true,
+            request: fallbackRetryRequestForLog,
+            response: { kind: 'primary_summary_fallback_retry', postSuccessError: err.message },
+            durationMs,
+          });
+          agent.reset();
+          this.eventGate?.onInferenceEnded(agent.name);
+          this.settleAgent(agent.name, {
+            stopReason: 'completed',
+            speech: '',
+          });
+          return;
+        }
+        await this.holdPrimarySummaryRetryFamily(
+          agent,
+          requestId,
+          primarySummaryRetry,
+          'primary_summary_fallback_retry_stream_threw',
+          { error: err.message },
+        );
+      } else if (primarySummaryConfig.enabled) {
         await this.updatePrimarySummaryRequestRecord(requestId, (record) => ({
           ...record,
-          finalStatus: primarySummaryRetry && !primarySummaryQuarantinePersisted
-            ? 'timeout_unknown'
-            : 'error',
+          finalStatus: 'error',
           fallbackHeldReason: err.message,
         }));
-        if (primarySummaryRetry && !primarySummaryQuarantinePersisted) {
-          await this.updatePrimarySummaryRequestRecord(primarySummaryRetry.originalRequestId, (record) => ({
-            ...record,
-            fallbackStatus: 'timeout_unknown',
-            fallbackHeldReason: err.message,
-          }));
-          this.opsAlert('refusal-held', agent.name, err.message);
-        }
       }
       this.emitTrace({
         type: 'inference:failed',
@@ -5382,6 +5962,24 @@ export class AgentFramework {
         error: err.message,
         stack: err.stack,
       });
+      if (primarySummaryRetry) {
+        this.logInference({
+          timestamp: startTime,
+          agentName: agent.name,
+          requestId,
+          success: false,
+          error: `Stream threw: ${err.message}`,
+          request: fallbackRetryRequestForLog,
+          durationMs,
+        });
+        agent.reset();
+        this.eventGate?.onInferenceEnded(agent.name);
+        this.settleAgent(agent.name, {
+          stopReason: 'completed',
+          speech: '',
+        });
+        return;
+      }
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
@@ -5402,7 +6000,7 @@ export class AgentFramework {
         requestId,
         success: false,
         error: `Stream threw: ${err.message}`,
-        request: compiledRequest ?? { note: 'streaming request threw' },
+        request: fallbackRetryRequestForLog,
         durationMs,
       });
       agent.reset();
