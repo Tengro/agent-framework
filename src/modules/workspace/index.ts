@@ -84,7 +84,7 @@ const GIF87A_SIGNATURE = Buffer.from('GIF87a', 'ascii');
 const GIF89A_SIGNATURE = Buffer.from('GIF89a', 'ascii');
 const RIFF_SIGNATURE = Buffer.from('RIFF', 'ascii');
 const WEBP_SIGNATURE = Buffer.from('WEBP', 'ascii');
-const JPEG_SOF_MARKERS = new Set([0xc0, 0xc1, 0xc2]);
+const JPEG_SOF_MARKERS = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
 const GIF_TRAILER = 0x3b;
 const GIF_EXTENSION = 0x21;
 const GIF_IMAGE_DESCRIPTOR = 0x2c;
@@ -121,6 +121,10 @@ function requireBufferRange(bytes: Buffer, start: number, length: number, format
   }
 }
 
+function readUInt24LE(bytes: Buffer, offset: number): number {
+  return bytes[offset]! + (bytes[offset + 1]! << 8) + (bytes[offset + 2]! << 16);
+}
+
 function parseGifSubBlocks(bytes: Buffer, offset: number, mountPrefixedPath: string): number {
   while (true) {
     requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
@@ -135,6 +139,7 @@ function parseGifSubBlocks(bytes: Buffer, offset: number, mountPrefixedPath: str
 function validatePng(bytes: Buffer, mountPrefixedPath: string): void {
   let offset = PNG_SIGNATURE.length;
   let sawIend = false;
+  let sawNonEmptyIdat = false;
 
   while (!sawIend) {
     requireBufferRange(bytes, offset, 12, 'PNG', mountPrefixedPath);
@@ -156,8 +161,12 @@ function validatePng(bytes: Buffer, mountPrefixedPath: string): void {
       }
     }
 
+    if (chunkType === 'IDAT' && chunkLength > 0) {
+      sawNonEmptyIdat = true;
+    }
+
     if (chunkType === 'IEND') {
-      if (chunkLength !== 0 || nextOffset !== bytes.length) {
+      if (chunkLength !== 0 || nextOffset !== bytes.length || !sawNonEmptyIdat) {
         invalidImage('PNG', mountPrefixedPath);
       }
       sawIend = true;
@@ -208,6 +217,11 @@ function validateGif(bytes: Buffer, mountPrefixedPath: string): void {
 
     sawImage = true;
     requireBufferRange(bytes, offset, 9, 'GIF', mountPrefixedPath);
+    const imageWidth = bytes.readUInt16LE(offset + 4);
+    const imageHeight = bytes.readUInt16LE(offset + 6);
+    if (imageWidth === 0 || imageHeight === 0) {
+      invalidImage('GIF', mountPrefixedPath);
+    }
     const imagePacked = bytes[offset + 8]!;
     offset += 9;
     if ((imagePacked & 0x80) !== 0) {
@@ -217,7 +231,11 @@ function validateGif(bytes: Buffer, mountPrefixedPath: string): void {
     }
 
     requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
-    offset += 1; // LZW minimum code size
+    const lzwMinimumCodeSize = bytes[offset]!;
+    if (lzwMinimumCodeSize < 2 || lzwMinimumCodeSize > 8) {
+      invalidImage('GIF', mountPrefixedPath);
+    }
+    offset += 1;
     offset = parseGifSubBlocks(bytes, offset, mountPrefixedPath);
   }
 
@@ -331,8 +349,82 @@ function validateJpeg(bytes: Buffer, mountPrefixedPath: string): void {
   invalidImage('JPEG', mountPrefixedPath);
 }
 
+function validateWebpVp8Chunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength <= 10) invalidImage('WebP', mountPrefixedPath);
+  if (bytes[chunkDataOffset + 3] !== 0x9d || bytes[chunkDataOffset + 4] !== 0x01 || bytes[chunkDataOffset + 5] !== 0x2a) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+  const width = bytes.readUInt16LE(chunkDataOffset + 6) & 0x3fff;
+  const height = bytes.readUInt16LE(chunkDataOffset + 8) & 0x3fff;
+  if (width === 0 || height === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function validateWebpVp8lChunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength <= 5 || bytes[chunkDataOffset] !== 0x2f) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+  const packed = bytes.readUInt32LE(chunkDataOffset + 1);
+  const width = (packed & 0x3fff) + 1;
+  const height = ((packed >> 14) & 0x3fff) + 1;
+  if (width === 0 || height === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function validateWebpVp8xChunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength !== 10) invalidImage('WebP', mountPrefixedPath);
+  const width = 1 + readUInt24LE(bytes, chunkDataOffset + 4);
+  const height = 1 + readUInt24LE(bytes, chunkDataOffset + 7);
+  if (width === 0 || height === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function validateWebpAnmfChunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength <= 16) invalidImage('WebP', mountPrefixedPath);
+
+  const frameWidth = 1 + readUInt24LE(bytes, chunkDataOffset + 6);
+  const frameHeight = 1 + readUInt24LE(bytes, chunkDataOffset + 9);
+  if (frameWidth === 0 || frameHeight === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+
+  const chunkDataEnd = chunkDataOffset + chunkLength;
+  let nestedOffset = chunkDataOffset + 16;
+  let sawFramePayload = false;
+
+  while (nestedOffset < chunkDataEnd) {
+    requireBufferRange(bytes, nestedOffset, 8, 'WebP', mountPrefixedPath);
+    const nestedChunkType = bytes.toString('ascii', nestedOffset, nestedOffset + 4);
+    const nestedChunkLength = bytes.readUInt32LE(nestedOffset + 4);
+    const nestedChunkDataOffset = nestedOffset + 8;
+    const nestedChunkEnd = nestedChunkDataOffset + nestedChunkLength;
+    const nestedPaddedChunkEnd = nestedChunkEnd + (nestedChunkLength % 2);
+    requireBufferRange(bytes, nestedChunkDataOffset, nestedChunkLength, 'WebP', mountPrefixedPath);
+    if (nestedPaddedChunkEnd > chunkDataEnd) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+
+    if (nestedChunkType === 'VP8 ') {
+      validateWebpVp8Chunk(bytes, nestedChunkDataOffset, nestedChunkLength, mountPrefixedPath);
+      sawFramePayload = true;
+    } else if (nestedChunkType === 'VP8L') {
+      validateWebpVp8lChunk(bytes, nestedChunkDataOffset, nestedChunkLength, mountPrefixedPath);
+      sawFramePayload = true;
+    }
+
+    nestedOffset = nestedPaddedChunkEnd;
+  }
+
+  if (!sawFramePayload || nestedOffset !== chunkDataEnd) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
 function validateWebp(bytes: Buffer, mountPrefixedPath: string): void {
-  requireBufferRange(bytes, 0, 20, 'WebP', mountPrefixedPath);
+  requireBufferRange(bytes, 0, 12, 'WebP', mountPrefixedPath);
 
   const declaredLength = bytes.readUInt32LE(4);
   if (declaredLength + 8 !== bytes.length) {
@@ -342,61 +434,48 @@ function validateWebp(bytes: Buffer, mountPrefixedPath: string): void {
     invalidImage('WebP', mountPrefixedPath);
   }
 
-  const chunkType = bytes.toString('ascii', 12, 16);
-  const chunkLength = bytes.readUInt32LE(16);
-  const chunkDataOffset = 20;
-  const chunkDataEnd = chunkDataOffset + chunkLength;
-  const paddedChunkEnd = chunkDataEnd + (chunkLength % 2);
-  requireBufferRange(bytes, chunkDataOffset, chunkLength, 'WebP', mountPrefixedPath);
-  if (paddedChunkEnd > bytes.length) {
+  let offset = 12;
+  let sawVp8x = false;
+  let sawImagePayload = false;
+
+  while (offset < bytes.length) {
+    requireBufferRange(bytes, offset, 8, 'WebP', mountPrefixedPath);
+    const chunkType = bytes.toString('ascii', offset, offset + 4);
+    const chunkLength = bytes.readUInt32LE(offset + 4);
+    const chunkDataOffset = offset + 8;
+    const chunkDataEnd = chunkDataOffset + chunkLength;
+    const paddedChunkEnd = chunkDataEnd + (chunkLength % 2);
+    requireBufferRange(bytes, chunkDataOffset, chunkLength, 'WebP', mountPrefixedPath);
+    if (paddedChunkEnd > bytes.length) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+
+    if (chunkType === 'VP8 ') {
+      validateWebpVp8Chunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawImagePayload = true;
+    } else if (chunkType === 'VP8L') {
+      validateWebpVp8lChunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawImagePayload = true;
+    } else if (chunkType === 'VP8X') {
+      if (sawVp8x || offset !== 12) {
+        invalidImage('WebP', mountPrefixedPath);
+      }
+      validateWebpVp8xChunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawVp8x = true;
+    } else if (chunkType === 'ANMF') {
+      if (!sawVp8x) {
+        invalidImage('WebP', mountPrefixedPath);
+      }
+      validateWebpAnmfChunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawImagePayload = true;
+    }
+
+    offset = paddedChunkEnd;
+  }
+
+  if (!sawImagePayload) {
     invalidImage('WebP', mountPrefixedPath);
   }
-
-  if (chunkType === 'VP8 ') {
-    if (chunkLength < 10) invalidImage('WebP', mountPrefixedPath);
-    if (bytes[chunkDataOffset + 3] !== 0x9d || bytes[chunkDataOffset + 4] !== 0x01 || bytes[chunkDataOffset + 5] !== 0x2a) {
-      invalidImage('WebP', mountPrefixedPath);
-    }
-    const width = bytes.readUInt16LE(chunkDataOffset + 6) & 0x3fff;
-    const height = bytes.readUInt16LE(chunkDataOffset + 8) & 0x3fff;
-    if (width === 0 || height === 0) {
-      invalidImage('WebP', mountPrefixedPath);
-    }
-    return;
-  }
-
-  if (chunkType === 'VP8L') {
-    if (chunkLength < 5 || bytes[chunkDataOffset] !== 0x2f) {
-      invalidImage('WebP', mountPrefixedPath);
-    }
-    const packed = bytes.readUInt32LE(chunkDataOffset + 1);
-    const width = (packed & 0x3fff) + 1;
-    const height = ((packed >> 14) & 0x3fff) + 1;
-    if (width === 0 || height === 0) {
-      invalidImage('WebP', mountPrefixedPath);
-    }
-    return;
-  }
-
-  if (chunkType === 'VP8X') {
-    if (chunkLength < 10) invalidImage('WebP', mountPrefixedPath);
-    const width =
-      1
-      + bytes[chunkDataOffset + 4]!
-      + ((bytes[chunkDataOffset + 5] ?? 0) << 8)
-      + ((bytes[chunkDataOffset + 6] ?? 0) << 16);
-    const height =
-      1
-      + bytes[chunkDataOffset + 7]!
-      + ((bytes[chunkDataOffset + 8] ?? 0) << 8)
-      + ((bytes[chunkDataOffset + 9] ?? 0) << 16);
-    if (width === 0 || height === 0) {
-      invalidImage('WebP', mountPrefixedPath);
-    }
-    return;
-  }
-
-  invalidImage('WebP', mountPrefixedPath);
 }
 
 function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): SupportedImageMimeType {

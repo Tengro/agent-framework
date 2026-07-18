@@ -41,15 +41,81 @@ const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
 const GIF89A_SIGNATURE = Buffer.from('GIF89a', 'ascii');
 const WEBP_SIGNATURE = Buffer.concat([Buffer.from('RIFF', 'ascii'), Buffer.alloc(4), Buffer.from('WEBP', 'ascii')]);
 
+function u32be(value: number): Buffer {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32BE(value);
+  return buffer;
+}
+
+function u32le(value: number): Buffer {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32LE(value);
+  return buffer;
+}
+
 const INVALID_IMAGES = {
   signatureOnlyPng: { file: 'signature-only.png', bytes: PNG_SIGNATURE, error: 'Invalid PNG image: work/signature-only.png' },
   signatureOnlyJpeg: { file: 'signature-only.jpg', bytes: JPEG_SIGNATURE, error: 'Invalid JPEG image: work/signature-only.jpg' },
   signatureOnlyGif: { file: 'signature-only.gif', bytes: GIF89A_SIGNATURE, error: 'Invalid GIF image: work/signature-only.gif' },
   signatureOnlyWebp: { file: 'signature-only.webp', bytes: WEBP_SIGNATURE, error: 'Invalid WebP image: work/signature-only.webp' },
+  pngWithoutIdat: {
+    file: 'no-idat.png',
+    bytes: Buffer.concat([
+      PNG_SIGNATURE,
+      u32be(13),
+      Buffer.from('IHDR', 'ascii'),
+      Buffer.from([
+        0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x01,
+        0x08,
+        0x06,
+        0x00,
+        0x00,
+        0x00,
+      ]),
+      Buffer.alloc(4),
+      u32be(0),
+      Buffer.from('IEND', 'ascii'),
+      Buffer.alloc(4),
+    ]),
+    error: 'Invalid PNG image: work/no-idat.png',
+  },
   malformedPng: {
     file: 'malformed-chunk.png',
     bytes: Buffer.concat([PNG_SIGNATURE, Buffer.from([0x00, 0x00, 0x00, 0x0d]), Buffer.from('IHDR', 'ascii')]),
     error: 'Invalid PNG image: work/malformed-chunk.png',
+  },
+  zeroDescriptorGif: {
+    file: 'zero-descriptor.gif',
+    bytes: Buffer.from([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+      0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+      0x2c,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x01, 0x00,
+      0x00,
+      0x02,
+      0x01, 0x00,
+      0x00,
+      0x3b,
+    ]),
+    error: 'Invalid GIF image: work/zero-descriptor.gif',
+  },
+  invalidLzwGif: {
+    file: 'invalid-lzw.gif',
+    bytes: Buffer.from([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+      0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+      0x2c,
+      0x00, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x01, 0x00,
+      0x00,
+      0x01,
+      0x01, 0x00,
+      0x00,
+      0x3b,
+    ]),
+    error: 'Invalid GIF image: work/invalid-lzw.gif',
   },
   malformedGif: {
     file: 'malformed-block.gif',
@@ -79,6 +145,21 @@ const INVALID_IMAGES = {
       Buffer.from([0x0a, 0x00, 0x00, 0x00]),
     ]),
     error: 'Invalid WebP image: work/malformed-chunk.webp',
+  },
+  vp8xOnlyWebp: {
+    file: 'vp8x-only.webp',
+    bytes: Buffer.concat([
+      Buffer.from('RIFF', 'ascii'),
+      u32le(22),
+      Buffer.from('WEBPVP8X', 'ascii'),
+      u32le(10),
+      Buffer.from([
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+      ]),
+    ]),
+    error: 'Invalid WebP image: work/vp8x-only.webp',
   },
 } as const;
 
