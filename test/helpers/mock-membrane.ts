@@ -88,7 +88,7 @@ export class MockYieldingStream implements YieldingStream {
       this.events.push({ type: 'usage', usage: response.usage } as StreamEvent);
     }
 
-    if (response.stopReason === 'tool_use' && response.toolCalls.length > 0) {
+    if (response.toolCalls.length > 0) {
       this._isWaitingForTools = true;
       this._pendingToolCallIds = response.toolCalls.map((c) => c.id);
       this.events.push({
