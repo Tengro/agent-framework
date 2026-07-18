@@ -5,8 +5,8 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { readFile, stat, access, writeFile, unlink, mkdir } from 'node:fs/promises';
-import { join, resolve, relative, dirname } from 'node:path';
+import { readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
+import { join, resolve, relative, dirname, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -16,6 +16,7 @@ import type {
   MountState,
   WorkspaceModuleState,
   ReadInput,
+  ReadImageInput,
   WriteInput,
   EditInput,
   DeleteInput,
@@ -40,6 +41,7 @@ export type {
   MountState,
   WorkspaceModuleState,
   ReadInput,
+  ReadImageInput,
   WriteInput,
   EditInput,
   DeleteInput,
@@ -50,6 +52,82 @@ export type {
   MaterializeInput,
   SyncInput,
 } from './types.js';
+
+type SupportedImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+
+class WorkspaceImageReadError extends Error {
+  constructor(
+    readonly code:
+      | 'mount_unavailable'
+      | 'not_found'
+      | 'directory'
+      | 'symlink'
+      | 'escape'
+      | 'empty'
+      | 'too_large'
+      | 'truncated'
+      | 'unsupported'
+      | 'blob_missing',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'WorkspaceImageReadError';
+  }
+}
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
+const GIF87A_SIGNATURE = Buffer.from('GIF87a', 'ascii');
+const GIF89A_SIGNATURE = Buffer.from('GIF89a', 'ascii');
+const RIFF_SIGNATURE = Buffer.from('RIFF', 'ascii');
+const WEBP_SIGNATURE = Buffer.from('WEBP', 'ascii');
+
+function isErrnoCode(err: unknown, code: string): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: unknown }).code === code;
+}
+
+function startsWithBytes(buffer: Buffer, prefix: Buffer): boolean {
+  return buffer.length >= prefix.length && buffer.subarray(0, prefix.length).equals(prefix);
+}
+
+function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
+  return buffer.length > 0 && prefix.subarray(0, buffer.length).equals(buffer);
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+  if (candidate === root) return true;
+  const normalizedRoot = root.endsWith(sep) ? root : root + sep;
+  return candidate.startsWith(normalizedRoot);
+}
+
+function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): SupportedImageMimeType {
+  if (startsWithBytes(bytes, PNG_SIGNATURE)) return 'image/png';
+  if (matchesPartialPrefix(bytes, PNG_SIGNATURE)) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  if (startsWithBytes(bytes, JPEG_SIGNATURE)) return 'image/jpeg';
+  if (matchesPartialPrefix(bytes, JPEG_SIGNATURE)) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  if (startsWithBytes(bytes, GIF87A_SIGNATURE) || startsWithBytes(bytes, GIF89A_SIGNATURE)) return 'image/gif';
+  if (matchesPartialPrefix(bytes, GIF87A_SIGNATURE) || matchesPartialPrefix(bytes, GIF89A_SIGNATURE)) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  if (bytes.length >= 12 && startsWithBytes(bytes, RIFF_SIGNATURE) && bytes.subarray(8, 12).equals(WEBP_SIGNATURE)) {
+    return 'image/webp';
+  }
+  if (
+    (bytes.length < RIFF_SIGNATURE.length && matchesPartialPrefix(bytes, RIFF_SIGNATURE))
+    || (bytes.length >= RIFF_SIGNATURE.length && startsWithBytes(bytes, RIFF_SIGNATURE) && bytes.length < 12)
+  ) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  throw new WorkspaceImageReadError('unsupported', `Unsupported image format: ${mountPrefixedPath}`);
+}
 
 export class WorkspaceModule implements Module {
   readonly name = 'workspace';
@@ -270,6 +348,17 @@ export class WorkspaceModule implements Module {
         },
       },
       {
+        name: 'read_image',
+        description: 'Read an image file from the workspace and return native image content.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            path: { type: 'string', description: 'Image file path (mount-prefixed, e.g., "project/assets/logo.png")' },
+          },
+          required: ['path'],
+        },
+      },
+      {
         name: 'write',
         description: 'Create or overwrite a file in the workspace.',
         inputSchema: {
@@ -388,6 +477,7 @@ export class WorkspaceModule implements Module {
       const input = call.input as Record<string, unknown>;
       switch (call.name) {
         case 'read': return await this.handleRead(input as unknown as ReadInput);
+        case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
         case 'write': return await this.handleWrite(input as unknown as WriteInput);
         case 'edit': return await this.handleEdit(input as unknown as EditInput);
         case 'delete': return await this.handleDelete(input as unknown as DeleteInput);
@@ -568,6 +658,129 @@ export class WorkspaceModule implements Module {
     return this.store;
   }
 
+  private validateImageBytes(
+    bytes: Buffer,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): { bytes: Buffer; mimeType: SupportedImageMimeType } {
+    if (bytes.byteLength === 0) {
+      throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+    }
+    if (bytes.byteLength > maxSize) {
+      throw new WorkspaceImageReadError(
+        'too_large',
+        `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+      );
+    }
+    return {
+      bytes,
+      mimeType: detectImageMimeType(bytes, mountPrefixedPath),
+    };
+  }
+
+  private tryReadImageFromTree(
+    mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): { bytes: Buffer; mimeType: SupportedImageMimeType } | null {
+    const store = this.getStore();
+    const entry = store.treeGet(mount.treeStateId, relativePath);
+    if (!entry) return null;
+
+    const blob = store.getBlob(entry.blobHash);
+    if (!blob) {
+      throw new WorkspaceImageReadError('blob_missing', `Blob not found for: ${mountPrefixedPath}`);
+    }
+
+    return this.validateImageBytes(blob, mountPrefixedPath, maxSize);
+  }
+
+  private async readImageFromFilesystem(
+    mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
+    const lexicalPath = resolve(mount.config.path, relativePath);
+
+    let fileInfo: Awaited<ReturnType<typeof lstat>>;
+    try {
+      fileInfo = await lstat(lexicalPath);
+    } catch (err) {
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    }
+
+    if (fileInfo.isDirectory()) {
+      throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
+    }
+    if (fileInfo.isSymbolicLink() && !mount.config.followSymlinks) {
+      throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+    }
+
+    let realMountRoot: string;
+    try {
+      realMountRoot = await realpath(mount.config.path);
+    } catch {
+      throw new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
+    }
+
+    let realFilePath: string;
+    try {
+      realFilePath = await realpath(lexicalPath);
+    } catch (err) {
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${mountPrefixedPath}`);
+    }
+
+    if (!isContainedPath(realMountRoot, realFilePath)) {
+      throw new WorkspaceImageReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`);
+    }
+
+    let fileStat: Awaited<ReturnType<typeof stat>>;
+    try {
+      fileStat = await stat(realFilePath);
+    } catch (err) {
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to stat image file: ${mountPrefixedPath}`);
+    }
+
+    if (fileStat.isDirectory()) {
+      throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
+    }
+    if (!fileStat.isFile()) {
+      throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+    }
+    if (fileStat.size === 0) {
+      throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+    }
+    if (fileStat.size > maxSize) {
+      throw new WorkspaceImageReadError(
+        'too_large',
+        `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+      );
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(realFilePath);
+    } catch (err) {
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    }
+
+    return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
+  }
+
   /**
    * Persist a single write/edit/delete to disk when the mount opts in via
    * `autoMaterialize`. Required for cross-agent pipelines — another agent's
@@ -696,6 +909,78 @@ export class WorkspaceModule implements Module {
         content: formatted,
       },
     };
+  }
+
+  private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(input.path));
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+        isError: true,
+      };
+    }
+    if (!relativePath) {
+      return { success: false, error: `Path is a directory: ${input.path}`, isError: true };
+    }
+
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    let treeError: WorkspaceImageReadError | null = null;
+
+    try {
+      const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
+      if (image) {
+        return {
+          success: true,
+          data: [
+            {
+              type: 'text',
+              text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
+            },
+            {
+              type: 'image',
+              data: image.bytes.toString('base64'),
+              mimeType: image.mimeType,
+            },
+          ],
+        };
+      }
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) {
+        treeError = err;
+      } else {
+        throw err;
+      }
+    }
+
+    try {
+      const image = await this.readImageFromFilesystem(mount, relativePath, input.path, maxSize);
+      return {
+        success: true,
+        data: [
+          {
+            type: 'text',
+            text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
+          },
+          {
+            type: 'image',
+            data: image.bytes.toString('base64'),
+            mimeType: image.mimeType,
+          },
+        ],
+      };
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) {
+        if (err.code === 'not_found' && treeError) {
+          return { success: false, error: treeError.message, isError: true };
+        }
+        return { success: false, error: err.message, isError: true };
+      }
+      throw err;
+    }
   }
 
   private async handleWrite(input: WriteInput): Promise<ToolResult> {
