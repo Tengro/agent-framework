@@ -5,7 +5,8 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { open, readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
 import { join, resolve, relative, dirname, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
@@ -63,9 +64,11 @@ class WorkspaceImageReadError extends Error {
       | 'directory'
       | 'symlink'
       | 'escape'
+      | 'changed'
       | 'empty'
       | 'too_large'
       | 'truncated'
+      | 'invalid'
       | 'unsupported'
       | 'blob_missing',
     message: string,
@@ -81,6 +84,14 @@ const GIF87A_SIGNATURE = Buffer.from('GIF87a', 'ascii');
 const GIF89A_SIGNATURE = Buffer.from('GIF89a', 'ascii');
 const RIFF_SIGNATURE = Buffer.from('RIFF', 'ascii');
 const WEBP_SIGNATURE = Buffer.from('WEBP', 'ascii');
+const JPEG_SOF_MARKERS = new Set([0xc0, 0xc1, 0xc2]);
+const GIF_TRAILER = 0x3b;
+const GIF_EXTENSION = 0x21;
+const GIF_IMAGE_DESCRIPTOR = 0x2c;
+const JPEG_SOI = 0xd8;
+const JPEG_EOI = 0xd9;
+const JPEG_SOS = 0xda;
+const JPEG_TEM = 0x01;
 
 function isErrnoCode(err: unknown, code: string): boolean {
   return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: unknown }).code === code;
@@ -100,23 +111,321 @@ function isContainedPath(root: string, candidate: string): boolean {
   return candidate.startsWith(normalizedRoot);
 }
 
+function invalidImage(format: string, mountPrefixedPath: string): never {
+  throw new WorkspaceImageReadError('invalid', `Invalid ${format} image: ${mountPrefixedPath}`);
+}
+
+function requireBufferRange(bytes: Buffer, start: number, length: number, format: string, mountPrefixedPath: string): void {
+  if (start < 0 || length < 0 || start + length > bytes.length) {
+    invalidImage(format, mountPrefixedPath);
+  }
+}
+
+function parseGifSubBlocks(bytes: Buffer, offset: number, mountPrefixedPath: string): number {
+  while (true) {
+    requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
+    const blockLength = bytes[offset]!;
+    offset += 1;
+    if (blockLength === 0) return offset;
+    requireBufferRange(bytes, offset, blockLength, 'GIF', mountPrefixedPath);
+    offset += blockLength;
+  }
+}
+
+function validatePng(bytes: Buffer, mountPrefixedPath: string): void {
+  let offset = PNG_SIGNATURE.length;
+  let sawIend = false;
+
+  while (!sawIend) {
+    requireBufferRange(bytes, offset, 12, 'PNG', mountPrefixedPath);
+    const chunkLength = bytes.readUInt32BE(offset);
+    const chunkType = bytes.toString('ascii', offset + 4, offset + 8);
+    const chunkDataOffset = offset + 8;
+    const chunkEnd = chunkDataOffset + chunkLength;
+    const nextOffset = chunkEnd + 4;
+    requireBufferRange(bytes, chunkDataOffset, chunkLength + 4, 'PNG', mountPrefixedPath);
+
+    if (offset === PNG_SIGNATURE.length) {
+      if (chunkType !== 'IHDR' || chunkLength !== 13) {
+        invalidImage('PNG', mountPrefixedPath);
+      }
+      const width = bytes.readUInt32BE(chunkDataOffset);
+      const height = bytes.readUInt32BE(chunkDataOffset + 4);
+      if (width === 0 || height === 0) {
+        invalidImage('PNG', mountPrefixedPath);
+      }
+    }
+
+    if (chunkType === 'IEND') {
+      if (chunkLength !== 0 || nextOffset !== bytes.length) {
+        invalidImage('PNG', mountPrefixedPath);
+      }
+      sawIend = true;
+    }
+
+    offset = nextOffset;
+  }
+}
+
+function validateGif(bytes: Buffer, mountPrefixedPath: string): void {
+  requireBufferRange(bytes, 0, 13, 'GIF', mountPrefixedPath);
+  const width = bytes.readUInt16LE(6);
+  const height = bytes.readUInt16LE(8);
+  if (width === 0 || height === 0) {
+    invalidImage('GIF', mountPrefixedPath);
+  }
+
+  let offset = 13;
+  const packed = bytes[10]!;
+  if ((packed & 0x80) !== 0) {
+    const globalColorTableBytes = 3 * (1 << ((packed & 0x07) + 1));
+    requireBufferRange(bytes, offset, globalColorTableBytes, 'GIF', mountPrefixedPath);
+    offset += globalColorTableBytes;
+  }
+
+  let sawImage = false;
+  while (offset < bytes.length) {
+    const marker = bytes[offset]!;
+    offset += 1;
+
+    if (marker === GIF_TRAILER) {
+      if (!sawImage || offset !== bytes.length) {
+        invalidImage('GIF', mountPrefixedPath);
+      }
+      return;
+    }
+
+    if (marker === GIF_EXTENSION) {
+      requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
+      offset += 1; // extension label
+      offset = parseGifSubBlocks(bytes, offset, mountPrefixedPath);
+      continue;
+    }
+
+    if (marker !== GIF_IMAGE_DESCRIPTOR) {
+      invalidImage('GIF', mountPrefixedPath);
+    }
+
+    sawImage = true;
+    requireBufferRange(bytes, offset, 9, 'GIF', mountPrefixedPath);
+    const imagePacked = bytes[offset + 8]!;
+    offset += 9;
+    if ((imagePacked & 0x80) !== 0) {
+      const localColorTableBytes = 3 * (1 << ((imagePacked & 0x07) + 1));
+      requireBufferRange(bytes, offset, localColorTableBytes, 'GIF', mountPrefixedPath);
+      offset += localColorTableBytes;
+    }
+
+    requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
+    offset += 1; // LZW minimum code size
+    offset = parseGifSubBlocks(bytes, offset, mountPrefixedPath);
+  }
+
+  invalidImage('GIF', mountPrefixedPath);
+}
+
+function scanJpegEntropyData(bytes: Buffer, offset: number, mountPrefixedPath: string): number {
+  // Scan data can contain 0xFF byte-stuffing and restart markers.
+  while (offset < bytes.length) {
+    const value = bytes[offset]!;
+    offset += 1;
+    if (value !== 0xff) continue;
+
+    while (offset < bytes.length && bytes[offset] === 0xff) {
+      offset += 1;
+    }
+    if (offset >= bytes.length) invalidImage('JPEG', mountPrefixedPath);
+
+    const marker = bytes[offset]!;
+    if (marker === 0x00) {
+      offset += 1;
+      continue;
+    }
+    if (marker >= 0xd0 && marker <= 0xd7) {
+      offset += 1;
+      continue;
+    }
+    return offset - 1;
+  }
+
+  invalidImage('JPEG', mountPrefixedPath);
+}
+
+function validateJpeg(bytes: Buffer, mountPrefixedPath: string): void {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== JPEG_SOI) {
+    invalidImage('JPEG', mountPrefixedPath);
+  }
+
+  let offset = 2;
+  let sawSof = false;
+  let sawSos = false;
+
+  while (offset < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      invalidImage('JPEG', mountPrefixedPath);
+    }
+
+    while (offset < bytes.length && bytes[offset] === 0xff) {
+      offset += 1;
+    }
+    if (offset >= bytes.length) invalidImage('JPEG', mountPrefixedPath);
+
+    const marker = bytes[offset]!;
+    offset += 1;
+
+    if (marker === JPEG_EOI) {
+      if (!sawSof || !sawSos || offset !== bytes.length) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      return;
+    }
+    if (marker === JPEG_TEM || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+
+    requireBufferRange(bytes, offset, 2, 'JPEG', mountPrefixedPath);
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2) {
+      invalidImage('JPEG', mountPrefixedPath);
+    }
+    offset += 2;
+    const payloadOffset = offset;
+    const payloadLength = segmentLength - 2;
+    requireBufferRange(bytes, payloadOffset, payloadLength, 'JPEG', mountPrefixedPath);
+
+    if (JPEG_SOF_MARKERS.has(marker)) {
+      if (payloadLength < 6) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      const height = bytes.readUInt16BE(payloadOffset + 1);
+      const width = bytes.readUInt16BE(payloadOffset + 3);
+      const componentCount = bytes[payloadOffset + 5]!;
+      if (componentCount === 0 || payloadLength < 6 + (componentCount * 3)) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      if (width === 0 || height === 0) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      sawSof = true;
+    }
+
+    if (marker === JPEG_SOS) {
+      if (!sawSof) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      if (payloadLength < 6) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      const componentCount = bytes[payloadOffset]!;
+      if (componentCount === 0 || payloadLength < 1 + (componentCount * 2) + 3) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      sawSos = true;
+      offset = scanJpegEntropyData(bytes, payloadOffset + payloadLength, mountPrefixedPath);
+      continue;
+    }
+
+    offset = payloadOffset + payloadLength;
+  }
+
+  invalidImage('JPEG', mountPrefixedPath);
+}
+
+function validateWebp(bytes: Buffer, mountPrefixedPath: string): void {
+  requireBufferRange(bytes, 0, 20, 'WebP', mountPrefixedPath);
+
+  const declaredLength = bytes.readUInt32LE(4);
+  if (declaredLength + 8 !== bytes.length) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+  if (!bytes.subarray(8, 12).equals(WEBP_SIGNATURE)) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+
+  const chunkType = bytes.toString('ascii', 12, 16);
+  const chunkLength = bytes.readUInt32LE(16);
+  const chunkDataOffset = 20;
+  const chunkDataEnd = chunkDataOffset + chunkLength;
+  const paddedChunkEnd = chunkDataEnd + (chunkLength % 2);
+  requireBufferRange(bytes, chunkDataOffset, chunkLength, 'WebP', mountPrefixedPath);
+  if (paddedChunkEnd > bytes.length) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+
+  if (chunkType === 'VP8 ') {
+    if (chunkLength < 10) invalidImage('WebP', mountPrefixedPath);
+    if (bytes[chunkDataOffset + 3] !== 0x9d || bytes[chunkDataOffset + 4] !== 0x01 || bytes[chunkDataOffset + 5] !== 0x2a) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+    const width = bytes.readUInt16LE(chunkDataOffset + 6) & 0x3fff;
+    const height = bytes.readUInt16LE(chunkDataOffset + 8) & 0x3fff;
+    if (width === 0 || height === 0) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+    return;
+  }
+
+  if (chunkType === 'VP8L') {
+    if (chunkLength < 5 || bytes[chunkDataOffset] !== 0x2f) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+    const packed = bytes.readUInt32LE(chunkDataOffset + 1);
+    const width = (packed & 0x3fff) + 1;
+    const height = ((packed >> 14) & 0x3fff) + 1;
+    if (width === 0 || height === 0) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+    return;
+  }
+
+  if (chunkType === 'VP8X') {
+    if (chunkLength < 10) invalidImage('WebP', mountPrefixedPath);
+    const width =
+      1
+      + bytes[chunkDataOffset + 4]!
+      + ((bytes[chunkDataOffset + 5] ?? 0) << 8)
+      + ((bytes[chunkDataOffset + 6] ?? 0) << 16);
+    const height =
+      1
+      + bytes[chunkDataOffset + 7]!
+      + ((bytes[chunkDataOffset + 8] ?? 0) << 8)
+      + ((bytes[chunkDataOffset + 9] ?? 0) << 16);
+    if (width === 0 || height === 0) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+    return;
+  }
+
+  invalidImage('WebP', mountPrefixedPath);
+}
+
 function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): SupportedImageMimeType {
-  if (startsWithBytes(bytes, PNG_SIGNATURE)) return 'image/png';
+  if (startsWithBytes(bytes, PNG_SIGNATURE)) {
+    validatePng(bytes, mountPrefixedPath);
+    return 'image/png';
+  }
   if (matchesPartialPrefix(bytes, PNG_SIGNATURE)) {
     throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
   }
 
-  if (startsWithBytes(bytes, JPEG_SIGNATURE)) return 'image/jpeg';
+  if (startsWithBytes(bytes, JPEG_SIGNATURE)) {
+    validateJpeg(bytes, mountPrefixedPath);
+    return 'image/jpeg';
+  }
   if (matchesPartialPrefix(bytes, JPEG_SIGNATURE)) {
     throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
   }
 
-  if (startsWithBytes(bytes, GIF87A_SIGNATURE) || startsWithBytes(bytes, GIF89A_SIGNATURE)) return 'image/gif';
+  if (startsWithBytes(bytes, GIF87A_SIGNATURE) || startsWithBytes(bytes, GIF89A_SIGNATURE)) {
+    validateGif(bytes, mountPrefixedPath);
+    return 'image/gif';
+  }
   if (matchesPartialPrefix(bytes, GIF87A_SIGNATURE) || matchesPartialPrefix(bytes, GIF89A_SIGNATURE)) {
     throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
   }
 
   if (bytes.length >= 12 && startsWithBytes(bytes, RIFF_SIGNATURE) && bytes.subarray(8, 12).equals(WEBP_SIGNATURE)) {
+    validateWebp(bytes, mountPrefixedPath);
     return 'image/webp';
   }
   if (
@@ -703,6 +1012,7 @@ export class WorkspaceModule implements Module {
     maxSize: number,
   ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
     const lexicalPath = resolve(mount.config.path, relativePath);
+    const useNoFollow = !mount.config.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number';
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -728,57 +1038,90 @@ export class WorkspaceModule implements Module {
       throw new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
     }
 
-    let realFilePath: string;
+    let handle: Awaited<ReturnType<typeof open>> | null = null;
     try {
-      realFilePath = await realpath(lexicalPath);
+      handle = await open(lexicalPath, fsConstants.O_RDONLY | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
     } catch (err) {
       if (isErrnoCode(err, 'ENOENT')) {
         throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
       }
-      throw new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${mountPrefixedPath}`);
-    }
-
-    if (!isContainedPath(realMountRoot, realFilePath)) {
-      throw new WorkspaceImageReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`);
-    }
-
-    let fileStat: Awaited<ReturnType<typeof stat>>;
-    try {
-      fileStat = await stat(realFilePath);
-    } catch (err) {
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
-      }
-      throw new WorkspaceImageReadError('not_found', `Unable to stat image file: ${mountPrefixedPath}`);
-    }
-
-    if (fileStat.isDirectory()) {
-      throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
-    }
-    if (!fileStat.isFile()) {
-      throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
-    }
-    if (fileStat.size === 0) {
-      throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
-    }
-    if (fileStat.size > maxSize) {
-      throw new WorkspaceImageReadError(
-        'too_large',
-        `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
-      );
-    }
-
-    let bytes: Buffer;
-    try {
-      bytes = await readFile(realFilePath);
-    } catch (err) {
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      if (!mount.config.followSymlinks && isErrnoCode(err, 'ELOOP')) {
+        throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
       }
       throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
     }
 
-    return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
+    try {
+      const fileStat = await handle.stat();
+      if (fileStat.isDirectory()) {
+        throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
+      }
+      if (!fileStat.isFile()) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      if (fileStat.size === 0) {
+        throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+      }
+      if (fileStat.size > maxSize) {
+        throw new WorkspaceImageReadError(
+          'too_large',
+          `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+        );
+      }
+
+      if (!mount.config.followSymlinks && !useNoFollow) {
+        let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
+        try {
+          postOpenInfo = await lstat(lexicalPath);
+        } catch (err) {
+          if (isErrnoCode(err, 'ENOENT')) {
+            throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+          }
+          throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+        }
+        if (postOpenInfo.isSymbolicLink()) {
+          throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+        }
+      }
+
+      let realFilePath: string;
+      try {
+        realFilePath = await realpath(lexicalPath);
+      } catch (err) {
+        if (isErrnoCode(err, 'ENOENT')) {
+          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        }
+        throw new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${mountPrefixedPath}`);
+      }
+
+      if (!isContainedPath(realMountRoot, realFilePath)) {
+        throw new WorkspaceImageReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`);
+      }
+
+      let pathStat: Awaited<ReturnType<typeof stat>>;
+      try {
+        pathStat = await stat(realFilePath);
+      } catch (err) {
+        if (isErrnoCode(err, 'ENOENT')) {
+          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        }
+        throw new WorkspaceImageReadError('not_found', `Unable to stat image file: ${mountPrefixedPath}`);
+      }
+      if (pathStat.dev !== fileStat.dev || pathStat.ino !== fileStat.ino) {
+        throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+      }
+
+      const bytes = await handle.readFile();
+      return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) throw err;
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    } finally {
+      await handle?.close();
+    }
   }
 
   /**

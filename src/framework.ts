@@ -7278,6 +7278,51 @@ export class AgentFramework {
     return undefined;
   }
 
+  private approximateDecodedBase64Bytes(base64: string): number {
+    const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+    return Math.max(0, Math.floor(base64.length * 3 / 4) - padding);
+  }
+
+  private sanitizeProcessLogValue(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+    if (value && typeof value === 'object') {
+      const seenValue = seen.get(value);
+      if (seenValue) return seenValue;
+    }
+    if (Array.isArray(value)) {
+      const clone: unknown[] = [];
+      seen.set(value, clone);
+      for (const item of value) {
+        clone.push(this.sanitizeProcessLogValue(item, seen));
+      }
+      return clone;
+    }
+    if (!value || typeof value !== 'object') {
+      return value;
+    }
+
+    const record = value as Record<string, unknown>;
+    if (record.type === 'image' && typeof record.data === 'string' && typeof record.mimeType === 'string') {
+      const clone: Record<string, unknown> = {};
+      seen.set(value, clone);
+      for (const [key, child] of Object.entries(record)) {
+        if (key === 'data' || key === 'mimeType') continue;
+        clone[key] = this.sanitizeProcessLogValue(child, seen);
+      }
+      clone.type = 'image';
+      clone.mimeType = record.mimeType;
+      clone.approxByteLength = this.approximateDecodedBase64Bytes(record.data);
+      clone.redacted = true;
+      return clone;
+    }
+
+    const clone: Record<string, unknown> = {};
+    seen.set(value, clone);
+    for (const [key, child] of Object.entries(record)) {
+      clone[key] = this.sanitizeProcessLogValue(child, seen);
+    }
+    return clone;
+  }
+
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };
@@ -7311,15 +7356,15 @@ export class AgentFramework {
   private logProcessEvent(event: ProcessEvent, responses: ModuleProcessResponse[]): void {
     const entry: ProcessLogEntry = {
       timestamp: Date.now(),
-      processEvent: event,
-      responses,
+      processEvent: this.sanitizeProcessLogValue(event) as ProcessEvent,
+      responses: this.sanitizeProcessLogValue(responses) as ModuleProcessResponse[],
     };
 
     // Blob threshold: 10KB
     const BLOB_THRESHOLD = 10000;
 
     const entryToStore = { ...entry };
-    const responsesJson = JSON.stringify(responses);
+    const responsesJson = JSON.stringify(entry.responses);
     if (responsesJson.length > BLOB_THRESHOLD) {
       const blobId = this.store.storeBlob(Buffer.from(responsesJson), 'application/json');
       entryToStore.responses = { blobId };

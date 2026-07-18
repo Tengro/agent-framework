@@ -7,33 +7,80 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { MockMembrane, createMockResponse as createStreamResponse } from './helpers/mock-membrane.js';
+import type { Module, ModuleContext, ProcessState, EventResponse } from '../src/types/module.js';
+import type { ProcessEvent, ToolCall, ToolResult } from '../src/types/events.js';
 
 const TINY_IMAGES = {
   png: {
     mimeType: 'image/png',
     bytes: Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aY4AAAAASUVORK5CYII=',
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==',
       'base64',
     ),
   },
   jpeg: {
     mimeType: 'image/jpeg',
     bytes: Buffer.from(
-      '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAAQABADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAG+AP/EABQQAQAAAAAAAAAAAAAAAAAAADD/2gAIAQEAAQUCwf/EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8Bj//EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8Bj//Z',
+      '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==',
       'base64',
     ),
   },
   gif: {
     mimeType: 'image/gif',
-    bytes: Buffer.from('R0lGODdhAQABAIABAP///wAAACwAAAAAAQABAAACAkQBADs=', 'base64'),
+    bytes: Buffer.from('R0lGODdhAQABAIEAAP///wAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw==', 'base64'),
   },
   webp: {
     mimeType: 'image/webp',
-    bytes: Buffer.from('UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoQABAAPpFIoUylpCMiIAgAsBIJaQAA3AA/vuUAAA==', 'base64'),
+    bytes: Buffer.from('UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAUAmJaQAA3AA/vz0AAA=', 'base64'),
   },
 } as const;
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
+const GIF89A_SIGNATURE = Buffer.from('GIF89a', 'ascii');
+const WEBP_SIGNATURE = Buffer.concat([Buffer.from('RIFF', 'ascii'), Buffer.alloc(4), Buffer.from('WEBP', 'ascii')]);
+
+const INVALID_IMAGES = {
+  signatureOnlyPng: { file: 'signature-only.png', bytes: PNG_SIGNATURE, error: 'Invalid PNG image: work/signature-only.png' },
+  signatureOnlyJpeg: { file: 'signature-only.jpg', bytes: JPEG_SIGNATURE, error: 'Invalid JPEG image: work/signature-only.jpg' },
+  signatureOnlyGif: { file: 'signature-only.gif', bytes: GIF89A_SIGNATURE, error: 'Invalid GIF image: work/signature-only.gif' },
+  signatureOnlyWebp: { file: 'signature-only.webp', bytes: WEBP_SIGNATURE, error: 'Invalid WebP image: work/signature-only.webp' },
+  malformedPng: {
+    file: 'malformed-chunk.png',
+    bytes: Buffer.concat([PNG_SIGNATURE, Buffer.from([0x00, 0x00, 0x00, 0x0d]), Buffer.from('IHDR', 'ascii')]),
+    error: 'Invalid PNG image: work/malformed-chunk.png',
+  },
+  malformedGif: {
+    file: 'malformed-block.gif',
+    bytes: Buffer.from([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+      0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+      0x2c,
+      0x00, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x01, 0x00,
+      0x00,
+      0x02,
+      0x02, 0x4c,
+    ]),
+    error: 'Invalid GIF image: work/malformed-block.gif',
+  },
+  malformedJpeg: {
+    file: 'malformed-segment.jpg',
+    bytes: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x41, 0x42, 0xff, 0xd9]),
+    error: 'Invalid JPEG image: work/malformed-segment.jpg',
+  },
+  malformedWebp: {
+    file: 'malformed-chunk.webp',
+    bytes: Buffer.concat([
+      Buffer.from('RIFF', 'ascii'),
+      Buffer.from([0x0c, 0x00, 0x00, 0x00]),
+      Buffer.from('WEBPVP8X', 'ascii'),
+      Buffer.from([0x0a, 0x00, 0x00, 0x00]),
+    ]),
+    error: 'Invalid WebP image: work/malformed-chunk.webp',
+  },
+} as const;
 
 function createMockResponse(text = 'ok') {
   return {
@@ -67,6 +114,26 @@ function createIdleMembrane() {
       };
     },
   } as unknown as import('@animalabs/membrane').Membrane;
+}
+
+function createInferenceKickModule(): Module {
+  return {
+    name: 'kick',
+    async start(_ctx: ModuleContext): Promise<void> {},
+    async stop(): Promise<void> {},
+    getTools() {
+      return [];
+    },
+    async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+      return { success: false, error: 'unexpected tool call', isError: true };
+    },
+    async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+      if (event.type === 'external-message') {
+        return { requestInference: true };
+      }
+      return {};
+    },
+  };
 }
 
 function setupWorkspace(
@@ -248,6 +315,22 @@ test('unknown mount, mount root, directory, unknown/truncated/empty/oversize fil
   }
 });
 
+test('signature-only and malformed image structures are rejected before native delivery', async (t) => {
+  const { mountDir, workspace } = setupWorkspace(t);
+
+  for (const image of Object.values(INVALID_IMAGES)) {
+    writeFileSync(join(mountDir, image.file), image.bytes);
+  }
+
+  for (const image of Object.values(INVALID_IMAGES)) {
+    const result = await callReadImage(workspace, `work/${image.file}`);
+    assert.equal(result.success, false, image.file);
+    assert.equal(result.isError, true, image.file);
+    assert.equal(result.error, image.error, image.file);
+    assert.equal(result.data, undefined, image.file);
+  }
+});
+
 test('lexical traversal and symlink escape fail without leaking absolute paths', async (t) => {
   const { root, mountDir, workspace } = setupWorkspace(t, { followSymlinks: true });
   const outsideDir = join(root, 'outside');
@@ -310,4 +393,119 @@ test('framework native conversion emits an image block for the live round and hi
   assert.ok(history.includes('Path: work/native.png'));
   assert.ok(history.includes('[image: image/png,'));
   assert.ok(!history.includes(TINY_IMAGES.png.bytes.toString('base64')));
+});
+
+test('process logging persists a redacted image receipt while the live round keeps the exact base64 block', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'af-read-image-log-'));
+  const mountDir = join(root, 'mount');
+  mkdirSync(mountDir, { recursive: true });
+  writeFileSync(join(mountDir, 'native.png'), TINY_IMAGES.png.bytes);
+
+  const createWorkspace = () => new WorkspaceModule({
+    mounts: [
+      {
+        name: 'work',
+        path: mountDir,
+        mode: 'read-write',
+        watch: 'never',
+      },
+    ],
+  });
+
+  const storePath = join(root, 'framework.chronicle');
+  const membrane = new MockMembrane();
+  const workspaceModule = createWorkspace();
+  let framework: AgentFramework | null = null;
+  let reopened: AgentFramework | null = null;
+  membrane.pushResponse(createStreamResponse([
+    { type: 'text', text: 'Fetching the image.' },
+    { type: 'tool_use', id: 'img-1', name: 'workspace--read_image', input: { path: 'work/native.png' } },
+  ], 'tool_use'));
+  membrane.pushResponse(createStreamResponse([{ type: 'text', text: 'Done.' }]));
+
+  framework = await AgentFramework.create({
+    storePath,
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'mock', systemPrompt: 'test' }],
+    modules: [workspaceModule, createInferenceKickModule()],
+    processLogging: { persist: true },
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  });
+  workspaceModule.initStore(framework.getStore());
+
+  t.after(async () => {
+    await reopened?.stop().catch(() => {});
+    await framework?.stop().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  framework.pushEvent({
+    type: 'external-message',
+    source: 'test',
+    content: 'Read work/native.png',
+    metadata: {},
+  });
+  await framework.runUntilIdle();
+
+  const live = membrane.lastStream?.receivedToolResults[0] as Array<{
+    toolUseId: string;
+    isError: boolean;
+    content: Array<{ type: string; text?: string; source?: { type: string; data: string; mediaType: string } }>;
+  }> | undefined;
+  assert.ok(live);
+  assert.deepEqual(live, [
+    {
+      toolUseId: 'img-1',
+      isError: false,
+      content: [
+        {
+          type: 'text',
+          text: `Path: work/native.png\nMIME: image/png\nBytes: ${TINY_IMAGES.png.bytes.byteLength}`,
+        },
+        {
+          type: 'image',
+          source: {
+            type: 'base64',
+            data: TINY_IMAGES.png.bytes.toString('base64'),
+            mediaType: 'image/png',
+          },
+        },
+      ],
+    },
+  ]);
+
+  await framework.stop();
+  framework = null;
+
+  reopened = await AgentFramework.create({
+    storePath,
+    membrane: createIdleMembrane(),
+    agents: [{ name: 'assistant', model: 'mock', systemPrompt: 'test' }],
+    modules: [createWorkspace(), createInferenceKickModule()],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  });
+
+  const entryMeta = reopened
+    .queryProcessLogs({ eventType: 'tool-result', limit: 20 })
+    .entries
+    .find((entry) => entry.entry.processEvent.type === 'tool-result' && entry.entry.processEvent.callId === 'img-1');
+  assert.ok(entryMeta);
+
+  const persisted = reopened.getProcessLog(entryMeta!.sequence);
+  assert.ok(persisted);
+  const persistedJson = JSON.stringify(persisted.entry);
+  assert.ok(!persistedJson.includes(TINY_IMAGES.png.bytes.toString('base64')));
+  assert.equal(persistedJson.includes(mountDir), false);
+
+  const persistedImage = (persisted.entry.processEvent as {
+    result: { data: Array<Record<string, unknown>> };
+  }).result.data[1];
+  assert.deepEqual(persistedImage, {
+    type: 'image',
+    mimeType: 'image/png',
+    approxByteLength: TINY_IMAGES.png.bytes.byteLength,
+    redacted: true,
+  });
 });
