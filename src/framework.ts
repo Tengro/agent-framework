@@ -130,6 +130,9 @@ const PROCESS_LOG_ID = 'framework/process-log';
 const PRIMARY_SUMMARY_FALLBACK_STATE_ID = 'framework/primary-summary-fallback';
 const PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY = 'primarySummarySettlement';
 const PRIMARY_SUMMARY_SETTLEMENT_VERSION = 1;
+const PRIMARY_SUMMARY_SETTLEMENT_MAX_ID_LENGTH = 1024;
+const PRIMARY_SUMMARY_SETTLEMENT_MAX_NAME_LENGTH = 256;
+const PRIMARY_SUMMARY_SETTLEMENT_MAX_REASON_LENGTH = 256;
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
@@ -251,6 +254,14 @@ interface PrimarySummarySettlementMetadata {
   kind: PrimarySummarySettlementKind;
   entryIndex: number;
   entryCount: number;
+}
+
+interface PrimarySummaryLogicalSettlementEntry {
+  messages: StoredMessage[];
+  settlement: PrimarySummarySettlementMetadata;
+  participant: string;
+  content: ContentBlock[];
+  bodyGroupId?: string;
 }
 
 interface PrimarySummaryFallbackToolDispatchRecord {
@@ -2040,8 +2051,14 @@ export class AgentFramework {
   private buildNonExecutedToolResults(
     blocks: ReadonlyArray<ContentBlock>,
   ): ContentBlock[] {
+    const seenToolUseIds = new Set<string>();
     return blocks
       .filter((block): block is ContentBlock & { type: 'tool_use'; id: string } => block.type === 'tool_use')
+      .filter((block) => {
+        if (seenToolUseIds.has(block.id)) return false;
+        seenToolUseIds.add(block.id);
+        return true;
+      })
       .map((block) => ({
         type: 'tool_result' as const,
         toolUseId: block.id,
@@ -2102,46 +2119,58 @@ export class AgentFramework {
     };
   }
 
-  private parsePrimarySummarySettlementMetadata(message: StoredMessage): PrimarySummarySettlementMetadata | null {
+  private isBoundedNonEmptyString(value: unknown, maxLength: number): value is string {
+    return typeof value === 'string' && value.length > 0 && value.length <= maxLength;
+  }
+
+  private isSafeNonNegativeInteger(value: unknown): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+  }
+
+  private primarySummarySettlementRequestId(message: StoredMessage): string | null {
+    const raw = message.metadata?.[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY];
+    if (!raw || typeof raw !== 'object') return null;
+    const requestId = (raw as { requestId?: unknown }).requestId;
+    return typeof requestId === 'string' ? requestId : null;
+  }
+
+  private parsePrimarySummarySettlementMetadata(
+    message: StoredMessage,
+  ): PrimarySummarySettlementMetadata | { invalidReason: string } | null {
     const raw = message.metadata?.[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY];
     if (!raw || typeof raw !== 'object') return null;
     const candidate = raw as Partial<PrimarySummarySettlementMetadata>;
     if (
       candidate.version !== PRIMARY_SUMMARY_SETTLEMENT_VERSION ||
-      typeof candidate.requestId !== 'string' ||
-      typeof candidate.settlementId !== 'string' ||
-      typeof candidate.agentName !== 'string' ||
+      !this.isBoundedNonEmptyString(candidate.requestId, PRIMARY_SUMMARY_SETTLEMENT_MAX_ID_LENGTH) ||
+      !this.isBoundedNonEmptyString(candidate.settlementId, PRIMARY_SUMMARY_SETTLEMENT_MAX_ID_LENGTH) ||
+      !this.isBoundedNonEmptyString(candidate.agentName, PRIMARY_SUMMARY_SETTLEMENT_MAX_NAME_LENGTH) ||
       (candidate.dispatchKind !== 'primary' && candidate.dispatchKind !== 'primary_summary_fallback_retry') ||
       (candidate.outcome !== 'success' && candidate.outcome !== 'held') ||
       typeof candidate.visibleAssistantOutput !== 'boolean' ||
-      !Number.isSafeInteger(candidate.executedToolCalls) ||
-      !Number.isSafeInteger(candidate.entryIndex) ||
-      !Number.isSafeInteger(candidate.entryCount) ||
+      !this.isSafeNonNegativeInteger(candidate.executedToolCalls) ||
+      !this.isSafeNonNegativeInteger(candidate.entryIndex) ||
+      !this.isSafeNonNegativeInteger(candidate.entryCount) ||
       (candidate.role !== 'assistant' && candidate.role !== 'user') ||
       (candidate.kind !== 'assistant_output' && candidate.kind !== 'generated_tool_result') ||
       !candidate.branch ||
-      typeof candidate.branch.id !== 'string' ||
-      typeof candidate.branch.name !== 'string' ||
-      !Number.isSafeInteger(candidate.branch.generation)
+      !this.isBoundedNonEmptyString(candidate.branch.id, PRIMARY_SUMMARY_SETTLEMENT_MAX_ID_LENGTH) ||
+      !this.isBoundedNonEmptyString(candidate.branch.name, PRIMARY_SUMMARY_SETTLEMENT_MAX_NAME_LENGTH) ||
+      !this.isSafeNonNegativeInteger(candidate.branch.generation) ||
+      candidate.entryCount < 1 ||
+      candidate.entryIndex >= candidate.entryCount ||
+      (candidate.stopReason !== undefined
+        && !this.isBoundedNonEmptyString(candidate.stopReason, PRIMARY_SUMMARY_SETTLEMENT_MAX_REASON_LENGTH)) ||
+      (candidate.holdReason !== undefined
+        && !this.isBoundedNonEmptyString(candidate.holdReason, PRIMARY_SUMMARY_SETTLEMENT_MAX_REASON_LENGTH)) ||
+      (candidate.providerInputTokens !== undefined
+        && !this.isSafeNonNegativeInteger(candidate.providerInputTokens)) ||
+      (candidate.outcome === 'held' && candidate.holdReason === undefined) ||
+      (candidate.outcome === 'success' && candidate.holdReason !== undefined)
     ) {
-      return null;
+      return { invalidReason: 'primary_summary_settlement_metadata_invalid_on_restart' };
     }
     return candidate as PrimarySummarySettlementMetadata;
-  }
-
-  private primarySummarySettlementMessages(
-    agent: Agent,
-    requestId: string,
-  ): Array<{ message: StoredMessage; settlement: PrimarySummarySettlementMetadata }> {
-    return agent.getContextManager().getAllMessages()
-      .map((message) => {
-        const settlement = this.parsePrimarySummarySettlementMetadata(message);
-        return settlement && settlement.requestId === requestId
-          ? { message, settlement }
-          : null;
-      })
-      .filter((entry): entry is { message: StoredMessage; settlement: PrimarySummarySettlementMetadata } => entry !== null)
-      .sort((left, right) => left.message.sequence - right.message.sequence);
   }
 
   private primarySummarySettlementMetadataConsistent(
@@ -2163,6 +2192,108 @@ export class AgentFramework {
       && left.branch.name === right.branch.name
       && left.branch.generation === right.branch.generation
       && left.entryCount === right.entryCount;
+  }
+
+  private primarySummaryShardEnvelopeConsistent(
+    participant: string,
+    left: PrimarySummarySettlementMetadata,
+    candidateParticipant: string,
+    right: PrimarySummarySettlementMetadata,
+  ): boolean {
+    return participant === candidateParticipant
+      && this.primarySummarySettlementMetadataConsistent(left, right)
+      && left.role === right.role
+      && left.kind === right.kind
+      && left.entryIndex === right.entryIndex;
+  }
+
+  private primarySummaryLogicalSettlementEntries(
+    agent: Agent,
+    requestId: string,
+  ): PrimarySummaryLogicalSettlementEntry[] | { invalidReason: string } {
+    const allMessages = agent.getContextManager().getAllMessages()
+      .slice()
+      .sort((left, right) => left.sequence - right.sequence);
+    const entries: PrimarySummaryLogicalSettlementEntry[] = [];
+    for (let index = 0; index < allMessages.length;) {
+      const message = allMessages[index]!;
+      if (this.primarySummarySettlementRequestId(message) !== requestId) {
+        index++;
+        continue;
+      }
+      const parsed = this.parsePrimarySummarySettlementMetadata(message);
+      if (!parsed) {
+        index++;
+        continue;
+      }
+      if ('invalidReason' in parsed) return parsed;
+
+      if (message.bodyGroupId === undefined) {
+        if (message.shardIndex !== undefined) {
+          return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+        }
+        entries.push({
+          messages: [message],
+          settlement: parsed,
+          participant: message.participant,
+          content: message.content,
+        });
+        index++;
+        continue;
+      }
+
+      const groupId = message.bodyGroupId;
+      if (!this.isBoundedNonEmptyString(groupId, PRIMARY_SUMMARY_SETTLEMENT_MAX_ID_LENGTH)) {
+        return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+      }
+      if (index > 0 && allMessages[index - 1]?.bodyGroupId === groupId) {
+        return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+      }
+
+      const groupMessages: StoredMessage[] = [];
+      while (index < allMessages.length && allMessages[index]!.bodyGroupId === groupId) {
+        groupMessages.push(allMessages[index]!);
+        index++;
+      }
+      if (allMessages.slice(index).some((candidate) => candidate.bodyGroupId === groupId)) {
+        return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+      }
+
+      const orderedGroupMessages: StoredMessage[] = [];
+      let expectedShardIndex = 0;
+      for (const groupMessage of groupMessages) {
+        if (this.primarySummarySettlementRequestId(groupMessage) !== requestId) {
+          return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+        }
+        const groupParsed = this.parsePrimarySummarySettlementMetadata(groupMessage);
+        if (!groupParsed) {
+          return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+        }
+        if ('invalidReason' in groupParsed) return groupParsed;
+        if (!this.primarySummaryShardEnvelopeConsistent(
+          message.participant,
+          parsed,
+          groupMessage.participant,
+          groupParsed,
+        )) {
+          return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+        }
+        if (groupMessage.shardIndex !== expectedShardIndex) {
+          return { invalidReason: 'primary_summary_settlement_shard_group_invalid_on_restart' };
+        }
+        orderedGroupMessages.push(groupMessage);
+        expectedShardIndex++;
+      }
+
+      entries.push({
+        messages: orderedGroupMessages,
+        settlement: parsed,
+        participant: message.participant,
+        content: orderedGroupMessages.flatMap((groupMessage) => groupMessage.content),
+        bodyGroupId: groupId,
+      });
+    }
+    return entries;
   }
 
   private primarySummaryContentMatches(
@@ -2315,14 +2446,16 @@ export class AgentFramework {
   ): Promise<'finalized' | { invalidReason: string } | false> {
     const agent = this.agents.get(record.agentName);
     if (!agent) return false;
-    const settlementMessages = this.primarySummarySettlementMessages(agent, record.requestId);
-    if (settlementMessages.length === 0) {
+    const settlementEntries = this.primarySummaryLogicalSettlementEntries(agent, record.requestId);
+    if ('invalidReason' in settlementEntries) return settlementEntries;
+    if (settlementEntries.length === 0) {
       return false;
     }
     const currentBranch = agent.getCurrentBranchGeneration();
-    const assistantEntry = settlementMessages[0]!;
+    const assistantEntry = settlementEntries[0]!;
     const settlement = assistantEntry.settlement;
     if (
+      assistantEntry.participant !== record.agentName ||
       settlement.agentName !== record.agentName ||
       settlement.dispatchKind !== record.dispatchKind ||
       settlement.entryIndex !== 0 ||
@@ -2336,8 +2469,10 @@ export class AgentFramework {
     }
     if (
       settlement.branch.id !== record.branch.id ||
+      settlement.branch.name !== record.branch.name ||
       settlement.branch.generation !== record.branch.generation ||
       settlement.branch.id !== currentBranch.id ||
+      settlement.branch.name !== currentBranch.name ||
       settlement.branch.generation !== currentBranch.generation
     ) {
       return { invalidReason: 'primary_summary_settlement_branch_mismatch_on_restart' };
@@ -2345,8 +2480,8 @@ export class AgentFramework {
     if (settlement.entryCount < 1 || settlement.entryCount > 2) {
       return { invalidReason: 'primary_summary_settlement_entry_count_invalid_on_restart' };
     }
-    const entriesByIndex = new Map<number, { message: StoredMessage; settlement: PrimarySummarySettlementMetadata }>();
-    for (const entry of settlementMessages) {
+    const entriesByIndex = new Map<number, PrimarySummaryLogicalSettlementEntry>();
+    for (const entry of settlementEntries) {
       if (!this.primarySummarySettlementMetadataConsistent(settlement, entry.settlement)) {
         return { invalidReason: 'primary_summary_settlement_marker_conflict_on_restart' };
       }
@@ -2356,14 +2491,21 @@ export class AgentFramework {
       entriesByIndex.set(entry.settlement.entryIndex, entry);
     }
     const placeholderEntry = entriesByIndex.get(1);
-    if (placeholderEntry && (placeholderEntry.settlement.role !== 'user' || placeholderEntry.settlement.kind !== 'generated_tool_result')) {
+    if (
+      placeholderEntry
+      && (
+        placeholderEntry.participant !== 'user'
+        || placeholderEntry.settlement.role !== 'user'
+        || placeholderEntry.settlement.kind !== 'generated_tool_result'
+      )
+    ) {
       return { invalidReason: 'primary_summary_settlement_placeholder_marker_invalid_on_restart' };
     }
     if ([...entriesByIndex.keys()].some((index) => index !== 0 && index !== 1)) {
       return { invalidReason: 'primary_summary_settlement_out_of_order_entries_on_restart' };
     }
     const expectedPlaceholder = settlement.outcome === 'held'
-      ? this.buildNonExecutedToolResults(assistantEntry.message.content)
+      ? this.buildNonExecutedToolResults(assistantEntry.content)
       : [];
     if (settlement.outcome === 'success') {
       if (settlement.entryCount !== 1 || placeholderEntry) {
@@ -2375,7 +2517,7 @@ export class AgentFramework {
         return { invalidReason: 'primary_summary_held_settlement_shape_invalid_on_restart' };
       }
       if (placeholderEntry) {
-        if (!this.primarySummaryContentMatches(placeholderEntry.message.content, expectedPlaceholder)) {
+        if (!this.primarySummaryContentMatches(placeholderEntry.content, expectedPlaceholder)) {
           return { invalidReason: 'primary_summary_settlement_placeholder_content_mismatch_on_restart' };
         }
       } else if (expectedPlaceholder.length > 0) {

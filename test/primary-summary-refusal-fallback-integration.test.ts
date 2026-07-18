@@ -248,16 +248,22 @@ function countMessagesContaining(messages: Array<{ content: ContentBlock[] }>, n
 
 function chronicleMessages(agent: NonNullable<ReturnType<AgentFramework['getAgent']>>): Array<{
   id: string;
+  sequence: number;
   participant: string;
   content: ContentBlock[];
   metadata?: Record<string, unknown>;
+  bodyGroupId?: string;
+  shardIndex?: number;
 }> {
   return (agent.getContextManager() as unknown as {
     getAllMessages: () => Array<{
       id: string;
+      sequence: number;
       participant: string;
       content: ContentBlock[];
       metadata?: Record<string, unknown>;
+      bodyGroupId?: string;
+      shardIndex?: number;
     }>;
   }).getAllMessages();
 }
@@ -267,12 +273,64 @@ function settlementMessages(
   requestId: string,
 ): Array<{
   id: string;
+  sequence: number;
   participant: string;
   content: ContentBlock[];
   metadata?: Record<string, unknown>;
+  bodyGroupId?: string;
+  shardIndex?: number;
 }> {
   return chronicleMessages(agent).filter((message) =>
     ((message.metadata?.[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY] as { requestId?: string } | undefined)?.requestId) === requestId);
+}
+
+function shardingStrategy(targetChunkTokens = 8): ProbeStrategy {
+  return new ProbeStrategy({
+    compressionModel: 'same-model',
+    targetChunkTokens,
+    recentWindowTokens: 0,
+    headWindowTokens: 0,
+    autoTickOnNewMessage: false,
+    minChunkCharsForLLM: 0,
+    mergeThreshold: 99,
+    adaptiveResolution: true,
+  });
+}
+
+function longShardText(label: string, repeat = 240): string {
+  return `${label} ${'segment '.repeat(repeat)}`;
+}
+
+function shardIngressContent(
+  strategy: ProbeStrategy,
+  participant: string,
+  content: ContentBlock[],
+): { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } {
+  const sharded = strategy.chunkIngressMessage(participant, content);
+  assert.ok(sharded, 'expected ingress sharding to activate');
+  assert.ok(sharded.shards.length > 1, 'expected multiple physical shards');
+  return sharded;
+}
+
+function appendPhysicalMessage(
+  agent: NonNullable<ReturnType<AgentFramework['getAgent']>>,
+  participant: string,
+  content: ContentBlock[],
+  metadata?: Record<string, unknown>,
+  extra?: { bodyGroupId?: string; shardIndex?: number },
+): string {
+  const message = (agent.getContextManager() as unknown as {
+    messageStore: {
+      append: (
+        participant: string,
+        content: ContentBlock[],
+        metadata?: Record<string, unknown>,
+        causedBy?: string[],
+        extra?: { bodyGroupId?: string; shardIndex?: number },
+      ) => { id: string };
+    };
+  }).messageStore.append(participant, content, metadata, undefined, extra);
+  return message.id;
 }
 
 function settlementMetadata(options: {
@@ -1339,6 +1397,724 @@ describe('primary summary refusal fallback integration', () => {
       assert.equal(settlementMessages(restarted.agent, requestId).length, 1, 'restart must not rewrite or finalize against the wrong branch generation');
     } finally {
       await restarted.framework.stop();
+    }
+  });
+
+  it('finalizes a long partial-text held settlement written as ingress shards exactly once on restart', async () => {
+    const requestId = 'sharded-partial-text-request';
+    const path = freshPath();
+    let assistantShardCount = 0;
+    const first = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [manualPrimaryRecord({
+          requestId,
+          finalStatus: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+        })],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [{ type: 'text', text: longShardText('long-held-text') }],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 1,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+      const persisted = settlementMessages(first.agent, requestId);
+      assistantShardCount = persisted.length;
+      assert.ok(assistantShardCount > 1, 'assistant settlement must shard physically');
+      assert.ok(persisted.every((message, index) =>
+        message.bodyGroupId === persisted[0]!.bodyGroupId && message.shardIndex === index));
+    } finally {
+      await first.framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      const settled = settlementMessages(restarted.agent, requestId);
+      assert.equal(settled.length, assistantShardCount);
+      assert.equal(countMessagesContaining(settled, NON_EXECUTED_TOOL_RESULT), 0);
+      const record = fallbackRecords(restarted.framework).find((entry) => entry.requestId === requestId)!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('repairs one missing placeholder after a sharded assistant settlement restart and never executes refused tools', async () => {
+    const requestId = 'sharded-placeholder-repair-request';
+    const path = freshPath();
+    let assistantShardCount = 0;
+    const first = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [manualPrimaryRecord({
+          requestId,
+          finalStatus: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+        })],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [
+          { type: 'thinking', thinking: 'repair reasoning', signature: 'sig-sharded-repair' } as ContentBlock,
+          { type: 'tool_use', id: 'repair-call', name: 'toolbox--echo', input: { message: FINAL_TOOL_ARG_SENTINEL } } as ContentBlock,
+          { type: 'text', text: longShardText('repair-placeholder') },
+        ],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 2,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+      assistantShardCount = settlementMessages(first.agent, requestId).length;
+      assert.ok(assistantShardCount > 1, 'assistant settlement must shard physically');
+    } finally {
+      await first.framework.stop();
+    }
+
+    const module = new EchoModule(() => false);
+    const restarted = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      modules: [module],
+      strategy: shardingStrategy(),
+    });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      assert.equal(module.calls.length, 0, 'restart repair must not execute refused tools');
+      const settled = settlementMessages(restarted.agent, requestId);
+      assert.equal(settled.length, assistantShardCount + 1);
+      const placeholders = settled.filter((message) => message.participant === 'user');
+      assert.equal(placeholders.length, 1);
+      const placeholder = placeholders[0]!.content[0] as ContentBlock & {
+        type: 'tool_result';
+        toolUseId: string;
+        content: string;
+        isError?: boolean;
+      };
+      assert.equal(placeholder.type, 'tool_result');
+      assert.equal(placeholder.toolUseId, 'repair-call');
+      assert.equal(placeholder.content, NON_EXECUTED_TOOL_RESULT);
+      assert.equal(placeholder.isError, true);
+      const record = fallbackRecords(restarted.framework).find((entry) => entry.requestId === requestId)!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('finalizes a complete sharded assistant plus placeholder settlement on restart without duplicate writes or effects', async () => {
+    const requestId = 'sharded-complete-request';
+    const path = freshPath();
+    let persistedCount = 0;
+    const first = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [manualPrimaryRecord({
+          requestId,
+          finalStatus: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+        })],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [
+          { type: 'thinking', thinking: 'paired reasoning', signature: 'sig-sharded-paired' } as ContentBlock,
+          { type: 'tool_use', id: 'paired-call', name: 'toolbox--echo', input: { message: FINAL_TOOL_ARG_SENTINEL } } as ContentBlock,
+          { type: 'text', text: longShardText('paired-placeholder') },
+        ],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 2,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+      first.agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'tool_result', toolUseId: 'paired-call', content: NON_EXECUTED_TOOL_RESULT, isError: true } as ContentBlock],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 1,
+          entryCount: 2,
+          role: 'user',
+          kind: 'generated_tool_result',
+        }),
+      );
+      persistedCount = settlementMessages(first.agent, requestId).length;
+      assert.ok(persistedCount > 2, 'assistant shards plus the placeholder must be persisted');
+    } finally {
+      await first.framework.stop();
+    }
+
+    const module = new EchoModule(() => false);
+    const restarted = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      modules: [module],
+      strategy: shardingStrategy(),
+    });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      assert.equal(module.calls.length, 0);
+      const settled = settlementMessages(restarted.agent, requestId);
+      assert.equal(settled.length, persistedCount);
+      assert.equal(countMessagesContaining(settled, NON_EXECUTED_TOOL_RESULT), 1);
+      const record = fallbackRecords(restarted.framework).find((entry) => entry.requestId === requestId)!;
+      assert.equal(record.finalStatus, 'held');
+      assert.equal(record.fallbackHeldReason, 'primary_summary_refusal_partial_output');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('fails closed on restart for invalid sharded settlement layouts', async () => {
+    const cases: Array<{
+      name: string;
+      expectedReason: string;
+      persist: (fixture: Awaited<ReturnType<typeof createFrameworkFixture>>, requestId: string) => void;
+    }> = [
+      {
+        name: 'missing shard',
+        expectedReason: 'primary_summary_settlement_shard_group_invalid_on_restart',
+        persist: (fixture, requestId) => {
+          const branch = fixture.agent.getCurrentBranchGeneration()!;
+          const metadata = settlementMetadata({
+            requestId,
+            holdReason: 'primary_summary_refusal_partial_output',
+            stopReason: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+            entryIndex: 0,
+            entryCount: 1,
+            role: 'assistant',
+            kind: 'assistant_output',
+          });
+          const shards = shardIngressContent(fixture.strategy, 'assistant', [{ type: 'text', text: longShardText('missing-shard-case') }]);
+          assert.ok(shards.shards.length > 2);
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[0]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 0,
+          });
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[2]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 2,
+          });
+        },
+      },
+      {
+        name: 'duplicate shard index',
+        expectedReason: 'primary_summary_settlement_shard_group_invalid_on_restart',
+        persist: (fixture, requestId) => {
+          const branch = fixture.agent.getCurrentBranchGeneration()!;
+          const metadata = settlementMetadata({
+            requestId,
+            holdReason: 'primary_summary_refusal_partial_output',
+            stopReason: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+            entryIndex: 0,
+            entryCount: 1,
+            role: 'assistant',
+            kind: 'assistant_output',
+          });
+          const shards = shardIngressContent(fixture.strategy, 'assistant', [{ type: 'text', text: longShardText('duplicate-shard-case') }]);
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[0]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 0,
+          });
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[1]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 0,
+          });
+        },
+      },
+      {
+        name: 'noncontiguous interleaved shard group',
+        expectedReason: 'primary_summary_settlement_shard_group_invalid_on_restart',
+        persist: (fixture, requestId) => {
+          const branch = fixture.agent.getCurrentBranchGeneration()!;
+          const metadata = settlementMetadata({
+            requestId,
+            holdReason: 'primary_summary_refusal_partial_output',
+            stopReason: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+            entryIndex: 0,
+            entryCount: 1,
+            role: 'assistant',
+            kind: 'assistant_output',
+          });
+          const shards = shardIngressContent(fixture.strategy, 'assistant', [{ type: 'text', text: longShardText('interleaved-shard-case') }]);
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[0]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 0,
+          });
+          fixture.agent.getContextManager().addMessage('User', [{ type: 'text', text: 'interleaved unrelated record' }]);
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[1]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 1,
+          });
+        },
+      },
+      {
+        name: 'conflicting envelope',
+        expectedReason: 'primary_summary_settlement_shard_group_invalid_on_restart',
+        persist: (fixture, requestId) => {
+          const branch = fixture.agent.getCurrentBranchGeneration()!;
+          const metadata = settlementMetadata({
+            requestId,
+            holdReason: 'primary_summary_refusal_partial_output',
+            stopReason: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+            entryIndex: 0,
+            entryCount: 1,
+            role: 'assistant',
+            kind: 'assistant_output',
+          });
+          const conflictingMetadata = settlementMetadata({
+            requestId,
+            settlementId: 'conflicting:v1',
+            holdReason: 'primary_summary_refusal_partial_output',
+            stopReason: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+            entryIndex: 0,
+            entryCount: 1,
+            role: 'assistant',
+            kind: 'assistant_output',
+          });
+          const shards = shardIngressContent(fixture.strategy, 'assistant', [{ type: 'text', text: longShardText('conflicting-envelope-case') }]);
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[0]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 0,
+          });
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[1]!.content, conflictingMetadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 1,
+          });
+        },
+      },
+      {
+        name: 'cross participant shard',
+        expectedReason: 'primary_summary_settlement_shard_group_invalid_on_restart',
+        persist: (fixture, requestId) => {
+          const branch = fixture.agent.getCurrentBranchGeneration()!;
+          const metadata = settlementMetadata({
+            requestId,
+            holdReason: 'primary_summary_refusal_partial_output',
+            stopReason: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+            entryIndex: 0,
+            entryCount: 1,
+            role: 'assistant',
+            kind: 'assistant_output',
+          });
+          const shards = shardIngressContent(fixture.strategy, 'assistant', [{ type: 'text', text: longShardText('cross-participant-case') }]);
+          appendPhysicalMessage(fixture.agent, 'assistant', shards.shards[0]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 0,
+          });
+          appendPhysicalMessage(fixture.agent, 'user', shards.shards[1]!.content, metadata, {
+            bodyGroupId: shards.bodyGroupId,
+            shardIndex: 1,
+          });
+        },
+      },
+      {
+        name: 'unsharded plus sharded duplicate entry index',
+        expectedReason: 'primary_summary_settlement_duplicate_entry_on_restart',
+        persist: (fixture, requestId) => {
+          const branch = fixture.agent.getCurrentBranchGeneration()!;
+          const metadata = settlementMetadata({
+            requestId,
+            holdReason: 'primary_summary_refusal_partial_output',
+            stopReason: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+            entryIndex: 0,
+            entryCount: 1,
+            role: 'assistant',
+            kind: 'assistant_output',
+          });
+          fixture.agent.getContextManager().addMessage(
+            'assistant',
+            [{ type: 'text', text: longShardText('duplicate-entry-case') }],
+            metadata,
+          );
+          fixture.agent.getContextManager().addMessage(
+            'assistant',
+            [{ type: 'text', text: 'duplicate logical entry' }],
+            metadata,
+          );
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const requestId = `invalid-layout-${testCase.name.replace(/[^a-z]+/gi, '-')}`;
+      const path = freshPath();
+      const first = await createFrameworkFixture({
+        path,
+        membrane: new ScriptedMembrane([]),
+        strategy: shardingStrategy(),
+      });
+      try {
+        const branch = first.agent.getCurrentBranchGeneration()!;
+        first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+          requests: [manualPrimaryRecord({
+            requestId,
+            finalStatus: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+          })],
+        });
+        testCase.persist(first, requestId);
+      } finally {
+        await first.framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({
+        path,
+        membrane: new ScriptedMembrane([]),
+        strategy: shardingStrategy(),
+      });
+      try {
+        assert.equal(restarted.membrane.calls.length, 0, `${testCase.name}: restart must not redispatch the provider`);
+        const current = fallbackRecords(restarted.framework).find((record) => record.requestId === requestId)!;
+        assert.equal(current.finalStatus, 'held', testCase.name);
+        assert.equal(current.fallbackHeldReason, testCase.expectedReason, testCase.name);
+      } finally {
+        await restarted.framework.stop();
+      }
+    }
+  });
+
+  it('does not let historical identical sharded content under another request satisfy the current settlement', async () => {
+    const path = freshPath();
+    const first = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [
+          manualPrimaryRecord({
+            requestId: 'historical-sharded-request',
+            finalStatus: 'held',
+            fallbackHeldReason: 'primary_summary_refusal_partial_output',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+          }),
+          manualPrimaryRecord({
+            requestId: 'current-sharded-request',
+            finalStatus: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+          }),
+        ],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [{ type: 'text', text: longShardText('historical-identical-content') }],
+        settlementMetadata({
+          requestId: 'historical-sharded-request',
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 1,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+      assert.ok(settlementMessages(first.agent, 'historical-sharded-request').length > 1);
+    } finally {
+      await first.framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      assert.equal(restarted.membrane.calls.length, 0);
+      assert.equal(settlementMessages(restarted.agent, 'current-sharded-request').length, 0);
+      const current = fallbackRecords(restarted.framework).find((record) => record.requestId === 'current-sharded-request')!;
+      assert.equal(current.finalStatus, 'held');
+      assert.equal(current.fallbackHeldReason, 'primary_summary_request_unresolved_on_restart');
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('repairs exactly one truthful placeholder result per tool_use on shard 0', async () => {
+    const requestId = 'multi-tool-use-request';
+    const path = freshPath();
+    const first = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      const branch = first.agent.getCurrentBranchGeneration()!;
+      first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+        requests: [manualPrimaryRecord({
+          requestId,
+          finalStatus: 'refusal',
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+        })],
+      });
+      first.agent.getContextManager().addMessage(
+        'assistant',
+        [
+          { type: 'thinking', thinking: 'multi-tool reasoning', signature: 'sig-multi-tool' } as ContentBlock,
+          { type: 'tool_use', id: 'call-a', name: 'toolbox--echo', input: { message: 'a' } } as ContentBlock,
+          { type: 'tool_use', id: 'call-b', name: 'toolbox--echo', input: { message: 'b' } } as ContentBlock,
+          { type: 'text', text: longShardText('multi-tool-placeholder') },
+        ],
+        settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 2,
+          role: 'assistant',
+          kind: 'assistant_output',
+        }),
+      );
+      const shards = settlementMessages(first.agent, requestId);
+      assert.ok(shards.length > 1);
+      assert.equal(
+        shards.filter((message) => message.content.some((block) => block.type === 'tool_use')).length,
+        1,
+        'all tool_use blocks must stay on shard 0',
+      );
+    } finally {
+      await first.framework.stop();
+    }
+
+    const restarted = await createFrameworkFixture({
+      path,
+      membrane: new ScriptedMembrane([]),
+      strategy: shardingStrategy(),
+    });
+    try {
+      const placeholders = settlementMessages(restarted.agent, requestId)
+        .filter((message) => message.participant === 'user');
+      assert.equal(placeholders.length, 1);
+      const results = placeholders[0]!.content.filter((block): block is ContentBlock & {
+        type: 'tool_result';
+        toolUseId: string;
+        content: string;
+        isError?: boolean;
+      } => block.type === 'tool_result');
+      assert.equal(results.length, 2);
+      assert.deepEqual(results.map((block) => block.toolUseId), ['call-a', 'call-b']);
+      assert.ok(results.every((block) => block.content === NON_EXECUTED_TOOL_RESULT && block.isError === true));
+    } finally {
+      await restarted.framework.stop();
+    }
+  });
+
+  it('fails closed on malformed optional and numeric settlement metadata without copying bad values into durable state or logs', async () => {
+    const oversizedStopReason = `OVERSIZED_STOP_REASON_SENTINEL_${'x'.repeat(320)}`;
+    const cases: Array<{
+      name: string;
+      mutate: (metadata: Record<string, unknown>) => void;
+      forbidden?: string;
+    }> = [
+      {
+        name: 'oversized stopReason',
+        mutate: (metadata) => {
+          ((metadata[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY] as Record<string, unknown>).stopReason) = oversizedStopReason;
+        },
+        forbidden: oversizedStopReason,
+      },
+      {
+        name: 'missing held holdReason',
+        mutate: (metadata) => {
+          delete (metadata[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY] as Record<string, unknown>).holdReason;
+        },
+      },
+      {
+        name: 'unsafe providerInputTokens',
+        mutate: (metadata) => {
+          ((metadata[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY] as Record<string, unknown>).providerInputTokens) = Number.MAX_SAFE_INTEGER + 1;
+        },
+      },
+      {
+        name: 'negative executedToolCalls',
+        mutate: (metadata) => {
+          ((metadata[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY] as Record<string, unknown>).executedToolCalls) = -1;
+        },
+      },
+      {
+        name: 'negative branch generation',
+        mutate: (metadata) => {
+          (((metadata[PRIMARY_SUMMARY_SETTLEMENT_METADATA_KEY] as Record<string, unknown>).branch as Record<string, unknown>).generation) = -1;
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const requestId = `malformed-metadata-${testCase.name.replace(/[^a-z]+/gi, '-')}`;
+      const path = freshPath();
+      const first = await createFrameworkFixture({
+        path,
+        membrane: new ScriptedMembrane([]),
+        strategy: shardingStrategy(),
+      });
+      try {
+        const branch = first.agent.getCurrentBranchGeneration()!;
+        first.framework.getStore().setStateJson(FALLBACK_STATE_ID, {
+          requests: [manualPrimaryRecord({
+            requestId,
+            finalStatus: 'refusal',
+            branchId: branch.id,
+            branchName: branch.name,
+            branchGeneration: branch.generation,
+          })],
+        });
+        const metadata = settlementMetadata({
+          requestId,
+          holdReason: 'primary_summary_refusal_partial_output',
+          stopReason: 'refusal',
+          providerInputTokens: 40,
+          visibleAssistantOutput: true,
+          executedToolCalls: 0,
+          branchId: branch.id,
+          branchName: branch.name,
+          branchGeneration: branch.generation,
+          entryIndex: 0,
+          entryCount: 1,
+          role: 'assistant',
+          kind: 'assistant_output',
+        });
+        testCase.mutate(metadata);
+        first.agent.getContextManager().addMessage(
+          'assistant',
+          [{ type: 'text', text: longShardText(`malformed-${testCase.name}`) }],
+          metadata,
+        );
+      } finally {
+        await first.framework.stop();
+      }
+
+      const restarted = await createFrameworkFixture({
+        path,
+        membrane: new ScriptedMembrane([]),
+        strategy: shardingStrategy(),
+      });
+      try {
+        const current = fallbackRecords(restarted.framework).find((record) => record.requestId === requestId)!;
+        assert.equal(current.finalStatus, 'held', testCase.name);
+        assert.equal(current.fallbackHeldReason, 'primary_summary_settlement_metadata_invalid_on_restart', testCase.name);
+        assert.equal(current.stopReason, 'refusal', testCase.name);
+        assert.equal(current.providerInputTokens, 40, testCase.name);
+        assert.equal(current.executedToolCalls, 0, testCase.name);
+        if (testCase.forbidden) {
+          assert.equal(jsonContains(fallbackState(restarted.framework), testCase.forbidden), false, testCase.name);
+          assert.equal(jsonContains(restarted.framework.healthSnapshot(), testCase.forbidden), false, testCase.name);
+          assert.equal(jsonContains(restarted.framework.queryInferenceLogs({ limit: 25 }), testCase.forbidden), false, testCase.name);
+          assert.equal(jsonContains(restarted.framework.queryProcessLogs({ limit: 25 }), testCase.forbidden), false, testCase.name);
+        }
+      } finally {
+        await restarted.framework.stop();
+      }
     }
   });
 
